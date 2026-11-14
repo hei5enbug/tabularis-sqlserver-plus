@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readZip } from "./archive.mjs";
-import { REQUIRED_ID, REQUIRED_MIN_RUNTIME, REQUIRED_VERSION } from "./preflight.mjs";
+import { REQUIRED_EXECUTABLE, REQUIRED_ID, assertManifestIdentity, manifestAssetPaths } from "./preflight.mjs";
 
 const REQUIRED_FILES = [
   ".tabularium",
@@ -11,8 +11,9 @@ const REQUIRED_FILES = [
   "LICENSE",
   "ui/dist/index.js",
   "explain/dist/index.iife.js",
-  "licenses/mssql-tds-preview-MIT.txt",
 ];
+const BINARY_NAMES = [REQUIRED_EXECUTABLE, `${REQUIRED_EXECUTABLE}.exe`];
+const ASSET_PREFIX = "assets/";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -27,22 +28,9 @@ function parseManifest(entries) {
   } catch (error) {
     throw new Error("ZIP .tabularium manifest contains invalid JSON.", { cause: error });
   }
-  assert(manifest.id === REQUIRED_ID, `ZIP manifest id must be ${REQUIRED_ID}.`);
-  assert(manifest.name === "SQL Server Plus", "ZIP manifest name must be SQL Server Plus.");
-  assert(manifest.version === REQUIRED_VERSION, `ZIP manifest version must be ${REQUIRED_VERSION}.`);
-  assert(manifest.min_runtime_version === REQUIRED_MIN_RUNTIME, `ZIP minimum runtime must be ${REQUIRED_MIN_RUNTIME}.`);
-  assert(manifest.kind === "driver" && manifest.engine === "sqlserver", "ZIP manifest driver type is invalid.");
-  assert(manifest.executable === "sqlserver-plugin", "ZIP manifest executable is invalid.");
-  assert(manifest.capabilities?.sql_dialect === "mssql", "ZIP manifest SQL dialect must be mssql.");
-
-  const referencedPaths = [manifest.readme, ...(manifest.ui_extensions ?? []).map(item => item.module), ...(manifest.explain_parsers ?? []).map(item => item.module)];
+  assertManifestIdentity(manifest, "ZIP manifest");
   assert(typeof manifest.readme === "string", "ZIP manifest README path is missing.");
-  assert(Array.isArray(manifest.ui_extensions) && manifest.ui_extensions.length > 0, "ZIP manifest has no UI extension.");
-  assert(Array.isArray(manifest.explain_parsers) && manifest.explain_parsers.length > 0, "ZIP manifest has no EXPLAIN parser.");
-  for (const extension of manifest.ui_extensions) {
-    assert(extension.driver === REQUIRED_ID, "ZIP manifest UI extension driver ID does not match.");
-  }
-  for (const relativePath of referencedPaths) {
+  for (const relativePath of manifestAssetPaths(manifest)) {
     assert(typeof relativePath === "string" && !relativePath.startsWith("/") && !relativePath.includes("\\"), "ZIP manifest contains an invalid asset path.");
     assert(entries.has(relativePath), `ZIP manifest references a missing file: ${relativePath}`);
   }
@@ -51,10 +39,12 @@ function parseManifest(entries) {
 
 export function inspectPluginArchive(buffer) {
   const entries = readZip(buffer);
-  const binaryNames = ["sqlserver-plugin", "sqlserver-plugin.exe"].filter(name => entries.has(name));
-  assert(binaryNames.length === 1, "ZIP must contain exactly one sqlserver-plugin or sqlserver-plugin.exe executable.");
+  const binaryNames = BINARY_NAMES.filter(name => entries.has(name));
+  assert(binaryNames.length === 1, `ZIP must contain exactly one ${BINARY_NAMES[0]} or ${BINARY_NAMES[1]} executable.`);
   const allowed = new Set([...REQUIRED_FILES, ...binaryNames]);
-  for (const name of entries.keys()) assert(allowed.has(name), `ZIP contains a disallowed file: ${name}`);
+  for (const name of entries.keys()) {
+    assert(allowed.has(name) || name.startsWith(ASSET_PREFIX), `ZIP contains a disallowed file: ${name}`);
+  }
   for (const name of REQUIRED_FILES) assert(entries.has(name), `ZIP is missing a required file: ${name}`);
   const manifest = parseManifest(entries);
   return { entries, manifest, binaryName: binaryNames[0] };
@@ -75,6 +65,15 @@ async function expectedDigest(value) {
   return match[1].toLowerCase();
 }
 
+export async function verifyArchive({ archivePath, sha256 }) {
+  assert(typeof archivePath === "string" && archivePath.length > 0, "--archive is required.");
+  assert(typeof sha256 === "string" && sha256.length > 0, "--sha256 is required.");
+  const archive = await readRegularInput(archivePath, "Plugin archive");
+  const digest = createHash("sha256").update(archive).digest("hex");
+  assert(digest === await expectedDigest(sha256), "Plugin archive SHA-256 verification failed.");
+  return inspectPluginArchive(archive);
+}
+
 async function directoryState(directoryPath) {
   try {
     const stat = await lstat(directoryPath);
@@ -91,22 +90,26 @@ async function ensureDirectory(directoryPath) {
   if (state === "missing") await mkdir(directoryPath);
 }
 
-export async function installArchive({ archivePath, sha256, profileDataDir, apply = false, renameImpl = rename }) {
-  assert(typeof archivePath === "string" && archivePath.length > 0, "--archive is required.");
-  assert(typeof sha256 === "string" && sha256.length > 0, "--sha256 is required.");
-  assert(typeof profileDataDir === "string" && path.isAbsolute(profileDataDir), "An absolute --profile-data-dir is required.");
+function resolvePluginsRoot({ profileDataDir, pluginsRoot }) {
+  assert((profileDataDir === undefined) !== (pluginsRoot === undefined), "Exactly one of --profile-data-dir or --plugins-root is required.");
+  if (profileDataDir !== undefined) {
+    assert(typeof profileDataDir === "string" && path.isAbsolute(profileDataDir), "An absolute --profile-data-dir is required.");
+    const profileRoot = path.resolve(profileDataDir);
+    return { anchor: profileRoot, anchorLabel: "The profile data directory", pluginsRoot: path.join(profileRoot, "plugins") };
+  }
+  assert(typeof pluginsRoot === "string" && path.isAbsolute(pluginsRoot), "An absolute --plugins-root is required.");
+  const root = path.resolve(pluginsRoot);
+  return { anchor: path.dirname(root), anchorLabel: "The parent of the plugins root", pluginsRoot: root };
+}
 
-  const archive = await readRegularInput(archivePath, "Plugin archive");
-  const digest = createHash("sha256").update(archive).digest("hex");
-  assert(digest === await expectedDigest(sha256), "Plugin archive SHA-256 verification failed.");
-  const inspected = inspectPluginArchive(archive);
+export async function installArchive({ archivePath, sha256, profileDataDir, pluginsRoot, apply = false, renameImpl = rename }) {
+  const inspected = await verifyArchive({ archivePath, sha256 });
+  const resolved = resolvePluginsRoot({ profileDataDir, pluginsRoot });
 
-  const profileRoot = path.resolve(profileDataDir);
-  assert(await directoryState(profileRoot) === "directory", "The profile data directory must exist.");
-  const pluginsRoot = path.join(profileRoot, "plugins");
-  const driversRoot = path.join(pluginsRoot, "drivers");
+  assert(await directoryState(resolved.anchor) === "directory", `${resolved.anchorLabel} must exist.`);
+  const driversRoot = path.join(resolved.pluginsRoot, "drivers");
   const target = path.join(driversRoot, REQUIRED_ID);
-  const pluginsState = await directoryState(pluginsRoot);
+  const pluginsState = await directoryState(resolved.pluginsRoot);
   const driversState = pluginsState === "directory" ? await directoryState(driversRoot) : "missing";
   const targetState = driversState === "directory" ? await directoryState(target) : "missing";
   const summary = {
@@ -119,7 +122,7 @@ export async function installArchive({ archivePath, sha256, profileDataDir, appl
   };
   if (!apply) return summary;
 
-  await ensureDirectory(pluginsRoot);
+  await ensureDirectory(resolved.pluginsRoot);
   await ensureDirectory(driversRoot);
   const stage = await mkdtemp(path.join(driversRoot, `.${REQUIRED_ID}.stage-`));
   let stageExists = true;
@@ -161,11 +164,12 @@ export async function installArchive({ archivePath, sha256, profileDataDir, appl
 }
 
 function parseArguments(argv) {
-  const result = { apply: false };
+  const result = { apply: false, verifyOnly: false };
   const keys = {
     "--archive": "archivePath",
     "--sha256": "sha256",
     "--profile-data-dir": "profileDataDir",
+    "--plugins-root": "pluginsRoot",
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -173,25 +177,34 @@ function parseArguments(argv) {
       result.apply = true;
       continue;
     }
-    if (!["--archive", "--sha256", "--profile-data-dir"].includes(argument)) {
-      throw new Error(`Unknown argument: ${argument}`);
+    if (argument === "--verify-only") {
+      result.verifyOnly = true;
+      continue;
     }
+    if (!Object.hasOwn(keys, argument)) throw new Error(`Unknown argument: ${argument}`);
     const value = argv[index + 1];
     if (!value || value.startsWith("--")) throw new Error(`${argument} requires a value.`);
     result[keys[argument]] = value;
     index += 1;
   }
+  assert(!(result.verifyOnly && result.apply), "--verify-only cannot be combined with --apply.");
   return result;
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
 if (invokedPath === fileURLToPath(import.meta.url)) {
   try {
-    const result = await installArchive(parseArguments(process.argv.slice(2)));
-    const action = result.applied ? "Installation complete" : "Dry run (no files changed)";
-    process.stdout.write(`${action}: ${result.id} ${result.version}\nTarget: ${result.target}\n`);
-    if (result.backupPath) process.stdout.write(`Previous package backup: ${result.backupPath}\n`);
-    if (!result.applied) process.stdout.write("Add --apply to apply this verified installation.\n");
+    const { verifyOnly, ...options } = parseArguments(process.argv.slice(2));
+    if (verifyOnly) {
+      const { manifest } = await verifyArchive(options);
+      process.stdout.write(`verified ${options.archivePath}: ${manifest.id} ${manifest.version}\n`);
+    } else {
+      const result = await installArchive(options);
+      const action = result.applied ? "Installation complete" : "Dry run (no files changed)";
+      process.stdout.write(`${action}: ${result.id} ${result.version}\nTarget: ${result.target}\n`);
+      if (result.backupPath) process.stdout.write(`Previous package backup: ${result.backupPath}\n`);
+      if (!result.applied) process.stdout.write("Add --apply to apply this verified installation.\n");
+    }
   } catch (error) {
     process.stderr.write(`Installation validation failed: ${error.message}\n`);
     process.exitCode = 1;

@@ -2,10 +2,8 @@
 name = "sqlserver-plugin"
 version = "1.0.0-beta.3+plus.1"
 edition = "2021"
-description = "Forked Tabularis Extended driver plugin for Microsoft SQL Server"
+description = "Tabularis driver plugin for Microsoft SQL Server"
 license = "Apache-2.0"
-repository = "https://github.com/hei5enbug/tabularis-sqlserver-plus"
-homepage = "https://github.com/hei5enbug/tabularis-sqlserver-plus"
 publish = false
 
 [dependencies]
@@ -27,13 +25,9 @@ mssql-tds-preview = "=0.1.0-preview.1"
 once_cell = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "=0.10.9"
 tokio = { version = "1", features = ["full"] }
-uuid = "1"
-
-[patch.crates-io]
-# Keep the locked preview version while requiring an actual server ATTENTION
-# acknowledgment before reporting query cancellation as confirmed.
-mssql-tds-preview = { path = "vendor/mssql-tds-preview" }
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux release archives link OpenSSL statically. The cross container used for

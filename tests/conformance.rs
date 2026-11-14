@@ -256,9 +256,7 @@ fn implemented_methods() -> BTreeSet<String> {
                 .split_once("\" =>")
                 .map(|(method, _)| method)
         })
-        // `cancel` is a JSON-RPC notification consumed by the reader as a
-        // protocol control message; it has no recorded result fixture.
-        .filter(|method| *method != "cancel" && !unsupported.contains(method))
+        .filter(|method| !unsupported.contains(method))
         .map(str::to_string)
         .collect()
 }

@@ -41,12 +41,15 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
 /// Parse one JSON-RPC line and return the response value (serialised
 /// downstream by `main.rs`). Never panics — parse errors and method
 /// failures are surfaced as JSON-RPC error responses.
-#[cfg(test)]
 pub async fn handle_line(line: &str) -> Value {
-    handle_line_with_execution(line, None).await
+    handle_line_with_scope(line, None, None).await
 }
 
-pub async fn handle_line_with_execution(line: &str, execution: Option<&ExecutionLease>) -> Value {
+pub async fn handle_line_with_scope(
+    line: &str,
+    scope: Option<crate::driver::service::registry::Scope>,
+    execution: Option<ExecutionLease>,
+) -> Value {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(err) => return error_response(Value::Null, -32700, &format!("parse error: {err}")),
@@ -59,18 +62,38 @@ pub async fn handle_line_with_execution(line: &str, execution: Option<&Execution
         .unwrap_or("")
         .to_string();
     let params = request.get("params").cloned().unwrap_or(Value::Null);
+    // A lease only applies to the call it was registered for.
     let execution = execution.filter(|lease| Some(lease.request_id()) == id.as_u64());
+    if crate::handlers::service::is_method(&method) {
+        return crate::handlers::service::dispatch(id, &params, &method, scope).await;
+    }
 
     match method.as_str() {
         "initialize" => {
             // Initialization is intentionally infallible: malformed known
             // values warn and fall back, while unknown keys are ignored.
             settings::initialize(&params);
+            if params.get("service_protocol").is_some() {
+                if params["service_protocol"] != 1 {
+                    return crate::driver::service::ServiceError::new(
+                        "PROTOCOL_MISMATCH",
+                        "Unsupported service protocol",
+                    )
+                    .response(id);
+                }
+                return ok_response(
+                    id,
+                    json!({"service_capabilities":crate::handlers::service::capabilities()}),
+                );
+            }
             ok_response(id, Value::Null)
         }
         "ping" => query::ping(id, &params).await,
         "test_connection" => query::test_connection(id, &params).await,
         "shutdown" => {
+            crate::driver::service::registry::cancel_all();
+            crate::cancellation::global().cancel_all();
+            crate::driver::service::sessions::shutdown().await;
             pool_manager::shutdown().await;
             ok_response(id, Value::Null)
         }
@@ -121,11 +144,8 @@ pub async fn handle_line_with_execution(line: &str, execution: Option<&Execution
         "apply_db_user_privileges" => users::apply_db_user_privileges(id, &params).await,
 
         // Query execution.
-        "execute_query" => query::execute_query_with_execution(id, &params, execution).await,
-        "execute_query_batch" => {
-            query::execute_query_batch_with_execution(id, &params, execution).await
-        }
-        "cancel" => Value::Null,
+        "execute_query" => query::execute_query(id, &params, execution.as_ref()).await,
+        "execute_query_batch" => query::execute_query_batch(id, &params, execution.as_ref()).await,
         "explain_query" => query::explain_query(id, &params).await,
 
         // CRUD.
@@ -212,7 +232,7 @@ pub fn respond<T: Serialize>(id: Value, outcome: Result<T, String>) -> Value {
 /// Turn a cancellable query result into its JSON-RPC response.
 pub fn respond_query<T: Serialize>(
     id: Value,
-    request_id: Option<u64>,
+    request_id: u64,
     outcome: Result<T, QueryExecutionError>,
 ) -> Value {
     match outcome {
@@ -220,15 +240,18 @@ pub fn respond_query<T: Serialize>(
             Ok(value) => ok_response(id, value),
             Err(err) => error_response(id, -32603, &format!("serialization failed: {err}")),
         },
-        Err(QueryExecutionError::CancelledConfirmed) => match request_id {
-            Some(request_id) => query_cancelled_response(id, request_id),
-            None => error_response(id, -32000, "SQL Server query cancellation was confirmed"),
-        },
+        Err(QueryExecutionError::CancelledBeforeDispatch) => {
+            query_cancelled_response(id, request_id, true)
+        }
+        Err(QueryExecutionError::Cancelled) => query_cancelled_response(id, request_id, false),
         Err(QueryExecutionError::Driver(message)) => error_response(id, -32000, &message),
     }
 }
 
-pub fn query_cancelled_response(id: Value, request_id: u64) -> Value {
+/// `server_termination_confirmed` is true only when no SQL had reached the
+/// server; the driver cannot witness the acknowledgement of a cancellation
+/// that interrupted running SQL.
+pub fn query_cancelled_response(id: Value, request_id: u64, server_confirmed: bool) -> Value {
     json!({
         "jsonrpc": "2.0",
         "error": {
@@ -237,7 +260,7 @@ pub fn query_cancelled_response(id: Value, request_id: u64) -> Value {
             "data": {
                 "kind": "query_cancelled",
                 "request_id": request_id,
-                "server_termination_confirmed": true,
+                "server_termination_confirmed": server_confirmed,
             }
         },
         "id": id,
@@ -276,12 +299,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 취소_확인_응답은_요청_id와_서버_확인_표시를_포함한다() {
+    fn dispatch_전_취소는_서버_확인_표시가_있는_취소_응답이_된다() {
         // given
-        let response_id = json!(71);
+        let outcome = Err::<Value, _>(QueryExecutionError::CancelledBeforeDispatch);
 
         // when
-        let response = query_cancelled_response(response_id.clone(), 71);
+        let response = respond_query(json!(71), 71, outcome);
 
         // then
         assert_eq!(
@@ -297,20 +320,36 @@ mod tests {
                         "server_termination_confirmed": true
                     }
                 },
-                "id": response_id
+                "id": 71
             })
         );
     }
 
     #[test]
-    fn 확인되지_않은_취소는_기존_driver_error를_그대로_보존한다() {
+    fn 실행_중_취소는_서버_확인을_주장하지_않는다() {
+        // given
+        let outcome = Err::<Value, _>(QueryExecutionError::Cancelled);
+
+        // when
+        let response = respond_query(json!(72), 72, outcome);
+
+        // then
+        assert_eq!(response["error"]["code"], -32800);
+        assert_eq!(
+            response["error"]["data"]["server_termination_confirmed"],
+            false
+        );
+    }
+
+    #[test]
+    fn 취소와_무관한_driver_오류는_기존_오류_응답을_그대로_보존한다() {
         // given
         let message = "SQL Server timeout: fixture deadline";
 
         // when
         let response = respond_query(
-            json!(72),
-            Some(72),
+            json!(73),
+            73,
             Err::<Value, _>(QueryExecutionError::Driver(message.to_string())),
         );
 
@@ -449,9 +488,7 @@ mod tests {
 
         let plugin_only: Vec<_> = dispatched
             .difference(&host_methods)
-            // `cancel` is a JSON-RPC notification consumed by the stdin
-            // reader as a protocol control message, not a host driver method.
-            .filter(|method| !matches!(**method, "shutdown" | "cancel"))
+            .filter(|method| **method != "shutdown")
             .copied()
             .collect();
         assert!(
@@ -491,6 +528,9 @@ mod tests {
 
     #[test]
     fn shutdown_closes_cached_pools_and_returns_null() {
+        let _gate = crate::driver::service::registry::SHUTDOWN_GATE
+            .write()
+            .unwrap();
         std::thread::Builder::new()
             .stack_size(crate::WORKER_STACK_SIZE)
             .spawn(|| {

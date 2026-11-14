@@ -1537,25 +1537,57 @@ fn request_burst_is_bounded_and_slow_query_does_not_block_ping() {
         .map(|_| plugin.send("ping", json!({ "params": params })))
         .collect();
 
-    let first = plugin.read_response();
-    let first_id = first["id"].as_u64().expect("response id");
-    assert!(ping_ids.contains(&first_id), "a ping must finish first");
+    // The driver admits at most 64 pending legacy requests and answers any
+    // further request at once with RESOURCE_LIMIT instead of blocking its
+    // reader. The first 64 requests (the slow query and 63 pings) are
+    // therefore always admitted; later pings are admitted or rejected
+    // depending on how fast earlier ones finish.
+    const GUARANTEED_ADMITTED_PINGS: usize = 63;
+    let mut responses = Vec::new();
+    let mut first_success_id = None;
+    for _ in 0..=200 {
+        let response = plugin.read_response();
+        if first_success_id.is_none() && response.get("error").is_none() {
+            first_success_id = Some(response["id"].as_u64().expect("response id"));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "the slow query blocked all JSON-RPC workers"
+            );
+        }
+        responses.push(response);
+    }
+    let first_success_id = first_success_id.expect("at least one response succeeded");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "the slow query blocked all JSON-RPC workers"
+        ping_ids.contains(&first_success_id),
+        "a ping must finish first"
     );
 
-    let mut seen = BTreeSet::from([first_id]);
-    for _ in 0..200 {
-        let response = plugin.read_response();
-        assert!(
-            response.get("error").is_none(),
-            "burst response: {response}"
-        );
-        seen.insert(response["id"].as_u64().expect("response id"));
+    let mut seen = BTreeSet::new();
+    let mut admitted_pings = 0;
+    for response in &responses {
+        let id = response["id"].as_u64().expect("response id");
+        assert!(seen.insert(id), "duplicate response: {response}");
+        if id == slow_id {
+            assert!(response.get("error").is_none(), "slow query: {response}");
+        } else if let Some(error) = response.get("error") {
+            assert_eq!(
+                error["data"]["code"], "RESOURCE_LIMIT",
+                "burst response: {response}"
+            );
+            assert_eq!(
+                error["data"]["outcome"], "not_applied",
+                "burst response: {response}"
+            );
+        } else {
+            admitted_pings += 1;
+        }
     }
     assert!(seen.contains(&slow_id));
     assert!(ping_ids.iter().all(|id| seen.contains(id)));
+    assert!(
+        admitted_pings >= GUARANTEED_ADMITTED_PINGS,
+        "only {admitted_pings} pings were admitted"
+    );
 }
 
 #[test]
@@ -2431,4 +2463,325 @@ fn database_user_lifecycle_privilege_diff_roles_and_ownership_guard() {
         "SELECT COUNT(*) AS login_count FROM sys.server_principals WHERE name = N'{LOGIN}'"
     ));
     assert_eq!(login["rows"], json!([[0]]));
+}
+
+/// Runs one call on its own thread so a plugin that never answers fails the
+/// test, and is killed, instead of hanging the suite.
+fn call_within(
+    plugin: Plugin,
+    method: &'static str,
+    params: Value,
+    limit: std::time::Duration,
+) -> (Plugin, Value) {
+    let pid = plugin.child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut plugin = plugin;
+        let response = plugin.call(method, params);
+        let _ = sender.send((plugin, response));
+    });
+    receiver.recv_timeout(limit).unwrap_or_else(|_| {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        panic!("{method} did not answer within {limit:?}")
+    })
+}
+
+fn mid_row_error_query(plugin: &mut Plugin, table: &str) -> String {
+    plugin.reset_table(
+        table,
+        "id INT NOT NULL PRIMARY KEY, value NVARCHAR(10) NOT NULL",
+    );
+    plugin.execute(format!(
+        "INSERT INTO [{TEST_SCHEMA}].[{table}] VALUES (1, N'1'), (2, N'x')"
+    ));
+    format!("SELECT id, CAST(value AS INT) AS n FROM [{TEST_SCHEMA}].[{table}] ORDER BY id")
+}
+
+#[test]
+fn 행을_보내던_중_실패한_조회_뒤에도_다음_조회는_멈추지_않고_답한다() {
+    // given
+    let mut plugin = Plugin::with_scratch_database();
+    let failing_query = mid_row_error_query(&mut plugin, "mid_row_error_reuse");
+    let failure = plugin.call_error(
+        "execute_query",
+        json!({ "params": connection_params(), "query": failing_query }),
+    );
+
+    // when
+    let (_plugin, response) = call_within(
+        plugin,
+        "execute_query",
+        json!({ "params": connection_params(), "query": "SELECT CAST(1 AS INT) AS x" }),
+        std::time::Duration::from_secs(30),
+    );
+
+    // then
+    assert!(failure.contains("245"), "{failure}");
+    assert_eq!(response["result"]["rows"], json!([[1]]), "{response}");
+}
+
+#[test]
+fn 일괄_실행에서_행을_보내던_중_실패하면_뒤_문장은_다시_실행하라는_오류로_바로_끝난다() {
+    // given
+    let mut plugin = Plugin::with_scratch_database();
+    let failing_query = mid_row_error_query(&mut plugin, "mid_row_error_batch");
+
+    // when
+    let (_plugin, response) = call_within(
+        plugin,
+        "execute_query_batch",
+        json!({
+            "params": connection_params(),
+            "queries": [failing_query, "SELECT CAST(1 AS INT) AS x"]
+        }),
+        std::time::Duration::from_secs(30),
+    );
+
+    // then
+    let statements = &response["result"];
+    let first = statements[0]["error"].as_str().unwrap_or_default();
+    let second = statements[1]["error"].as_str().unwrap_or_default();
+    assert!(first.contains("245"), "{response}");
+    assert!(second.contains("run this statement again"), "{response}");
+}
+
+/// Server-wide ring buffer of ATTENTION events, dropped again when the test
+/// ends, passes or not.
+struct AttentionCapture {
+    name: String,
+}
+
+impl AttentionCapture {
+    fn start(plugin: &mut Plugin, name: &str) -> Self {
+        let master = connection_params_for("master", "cancel-master");
+        let capture = Self {
+            name: name.to_string(),
+        };
+        plugin.execute_with(&master, capture.drop_sql());
+        plugin.execute_with(
+            &master,
+            format!(
+                "CREATE EVENT SESSION [{name}] ON SERVER \
+                 ADD EVENT sqlserver.attention(ACTION(sqlserver.session_id)) \
+                 ADD TARGET package0.ring_buffer; \
+                 ALTER EVENT SESSION [{name}] ON SERVER STATE = START"
+            ),
+        );
+        capture
+    }
+
+    fn drop_sql(&self) -> String {
+        let name = &self.name;
+        format!(
+            "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{name}') \
+             BEGIN \
+               IF EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'{name}') \
+                 ALTER EVENT SESSION [{name}] ON SERVER STATE = STOP; \
+               DROP EVENT SESSION [{name}] ON SERVER; \
+             END"
+        )
+    }
+
+    fn attentions_for(&self, plugin: &mut Plugin, session_id: i64) -> i64 {
+        let name = &self.name;
+        let sql = format!(
+            "SELECT CAST(t.target_data AS xml).value(\
+             'count(/RingBufferTarget/event[@name=\"attention\"]/action[@name=\"session_id\"]\
+             /value[text()=\"{session_id}\"])', 'int') \
+             FROM sys.dm_xe_session_targets t \
+             JOIN sys.dm_xe_sessions s ON t.event_session_address = s.address \
+             WHERE s.name = N'{name}'"
+        );
+        first_integer(
+            plugin,
+            &connection_params_for("master", "cancel-master"),
+            &sql,
+        )
+        .unwrap_or(0)
+    }
+}
+
+impl Drop for AttentionCapture {
+    fn drop(&mut self) {
+        let mut plugin = Plugin::spawn();
+        plugin.execute_with(
+            &connection_params_for("master", "cancel-master"),
+            self.drop_sql(),
+        );
+    }
+}
+
+fn first_integer(plugin: &mut Plugin, params: &Value, sql: &str) -> Option<i64> {
+    plugin.execute_with(params, sql)["rows"]
+        .get(0)
+        .and_then(|row| row.get(0))
+        .and_then(Value::as_i64)
+}
+
+/// Polls until `probe` returns a value, so a slow server cannot fail a test
+/// that only needs the condition to hold within a few seconds.
+fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn session_of_marked_request(plugin: &mut Plugin, marker: &str) -> Option<i64> {
+    first_integer(
+        plugin,
+        &connection_params_for("master", "cancel-master"),
+        &format!(
+            "SELECT TOP 1 r.session_id FROM sys.dm_exec_requests r \
+             CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t \
+             WHERE r.session_id <> @@SPID AND t.text LIKE N'%{marker}%'"
+        ),
+    )
+}
+
+fn send_cancel_notification(plugin: &mut Plugin, request_id: u64) {
+    let line = json!({
+        "jsonrpc": "2.0",
+        "method": "cancel",
+        "params": { "id": request_id },
+    });
+    writeln!(plugin.stdin, "{line}").expect("write cancel notification");
+    plugin.stdin.flush().expect("flush cancel notification");
+}
+
+/// Reads the next response on its own thread, so a plugin that never answers
+/// fails the test instead of hanging the suite.
+fn read_response_within(plugin: Plugin, limit: std::time::Duration) -> (Plugin, Value) {
+    let pid = plugin.child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut plugin = plugin;
+        let response = plugin.read_response();
+        let _ = sender.send((plugin, response));
+    });
+    receiver.recv_timeout(limit).unwrap_or_else(|_| {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        panic!("no response within {limit:?} after the cancel notification")
+    })
+}
+
+/// Starts `method` with a `WAITFOR` that would run for thirty seconds,
+/// cancels it with the host's `cancel` notification, and checks on the server
+/// that the request received an ATTENTION and ended, and that the session it
+/// ran on is not reused.
+fn assert_legacy_cancellation_reaches_the_server(method: &'static str, case: &str) {
+    // given
+    let mut plugin = Plugin::with_scratch_database();
+    let marker = format!("cancel-marker-{case}-{}", std::process::id());
+    let capture = AttentionCapture::start(&mut plugin, &format!("ss_cancel_{case}"));
+    let mut victim = connection_params();
+    victim["connection_id"] = json!(format!("cancel-victim-{case}"));
+    let long_statement =
+        format!("WAITFOR DELAY '00:00:30'; SELECT CAST(1 AS INT) AS late /* {marker} */");
+    let request = if method == "execute_query" {
+        json!({ "params": victim, "query": long_statement })
+    } else {
+        json!({
+            "params": victim,
+            "queries": [
+                "SELECT CAST(1 AS INT) AS first_ok",
+                long_statement,
+                "SELECT CAST(2 AS INT) AS never_run"
+            ],
+        })
+    };
+    let request_id = plugin.send(method, request);
+    let spid = wait_for("the long request to reach the server", || {
+        session_of_marked_request(&mut plugin, &marker)
+    });
+    let cancelled_connection = plugin.execute_with(
+        &connection_params_for("master", "cancel-master"),
+        format!(
+            "SELECT CAST(connection_id AS NVARCHAR(40)) FROM sys.dm_exec_connections \
+             WHERE session_id = {spid}"
+        ),
+    )["rows"][0][0]
+        .as_str()
+        .expect("connection id of the running request")
+        .to_string();
+
+    // when
+    let cancelled_at = std::time::Instant::now();
+    send_cancel_notification(&mut plugin, request_id);
+    let (mut plugin, response) = read_response_within(plugin, std::time::Duration::from_secs(20));
+
+    // then
+    assert!(
+        cancelled_at.elapsed() < std::time::Duration::from_secs(20),
+        "the thirty second WAITFOR was not interrupted"
+    );
+    assert_eq!(response["id"], request_id, "{response}");
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    assert_eq!(
+        response["error"]["data"]["request_id"], request_id,
+        "{response}"
+    );
+    assert!(response.get("result").is_none(), "{response}");
+    wait_for(
+        "the cancelled request to leave sys.dm_exec_requests",
+        || {
+            session_of_marked_request(&mut plugin, &marker)
+                .is_none()
+                .then_some(())
+        },
+    );
+    let attentions = wait_for("the server to log an ATTENTION", || {
+        Some(capture.attentions_for(&mut plugin, spid)).filter(|count| *count > 0)
+    });
+    assert_eq!(attentions, 1);
+
+    // The next call on the same connection gets a fresh physical connection.
+    // SQL Server reuses a freed session id at once, so the connection id
+    // tells the two apart, and the cancelled one is gone from the server.
+    let next_connection = connection_id_of_current_session(&mut plugin, &victim);
+    assert_ne!(
+        next_connection, cancelled_connection,
+        "the cancelled connection was reused"
+    );
+    let master = connection_params_for("master", "cancel-master");
+    wait_for("the cancelled connection to close", || {
+        let remaining = plugin.execute_with(
+            &master,
+            format!(
+                "SELECT COUNT(*) FROM sys.dm_exec_connections \
+                 WHERE connection_id = '{cancelled_connection}'"
+            ),
+        )["rows"][0][0]
+            .as_i64();
+        (remaining == Some(0)).then_some(())
+    });
+}
+
+fn connection_id_of_current_session(plugin: &mut Plugin, params: &Value) -> String {
+    plugin.execute_with(
+        params,
+        "SELECT CAST(connection_id AS NVARCHAR(40)) FROM sys.dm_exec_connections \
+         WHERE session_id = @@SPID",
+    )["rows"][0][0]
+        .as_str()
+        .expect("connection id")
+        .to_string()
+}
+
+#[test]
+fn 실행_중인_execute_query는_cancel_notification으로_서버에서_중단되고_세션은_재사용되지_않는다() {
+    assert_legacy_cancellation_reaches_the_server("execute_query", "single");
+}
+
+#[test]
+fn 실행_중인_execute_query_batch는_cancel_notification으로_서버에서_중단되고_세션은_재사용되지_않는다(
+) {
+    assert_legacy_cancellation_reaches_the_server("execute_query_batch", "batch");
 }

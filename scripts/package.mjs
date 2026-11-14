@@ -1,11 +1,17 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createZip } from "./archive.mjs";
-import { preflightManifest, readRegularFileUnder } from "./preflight.mjs";
+import { createZip, normalizeZipPath } from "./archive.mjs";
+import { REQUIRED_EXECUTABLE, preflightManifest, readRegularFileUnder } from "./preflight.mjs";
 
 const PLATFORMS = new Set(["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win-x64"]);
+const FIXED_SOURCES = [".tabularium", "README.md", "LICENSE", "ui/dist/index.js", "explain/dist/index.iife.js"];
+const ASSETS_DIRECTORY = "assets";
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
 
 async function readBinary(binaryPath, windows) {
   const fullPath = path.resolve(binaryPath);
@@ -16,35 +22,64 @@ async function readBinary(binaryPath, windows) {
   return readFile(fullPath);
 }
 
-export async function packagePlugin({ root = process.cwd(), binaryPath, platform, outputPath }) {
+async function listAssetFiles(root, directory = ASSETS_DIRECTORY) {
+  let children;
+  try {
+    children = await readdir(path.join(root, ...directory.split("/")), { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT" && directory === ASSETS_DIRECTORY) return [];
+    throw error;
+  }
+  const files = [];
+  for (const child of children) {
+    const relativePath = normalizeZipPath(`${directory}/${child.name}`);
+    assert(!child.isSymbolicLink(), `Package assets must not use a symbolic link: ${relativePath}`);
+    if (child.isDirectory()) files.push(...await listAssetFiles(root, relativePath));
+    else if (child.isFile()) files.push(relativePath);
+    else throw new Error(`Package assets must be regular files: ${relativePath}`);
+  }
+  return files.sort();
+}
+
+async function removeReplaceable(destination) {
+  let stat;
+  try {
+    stat = await lstat(destination);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  assert(stat.isFile() && !stat.isSymbolicLink(), `Package output path is not a regular file: ${destination}`);
+  await rm(destination);
+}
+
+async function assertAbsent(destination) {
+  try {
+    await lstat(destination);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`Package output path already exists: ${destination}`);
+}
+
+export async function packagePlugin({ root = process.cwd(), binaryPath, platform, outputPath, replace = false }) {
   root = path.resolve(root);
   if (!PLATFORMS.has(platform)) throw new Error(`Unsupported platform: ${platform}`);
   if (!binaryPath || !outputPath) throw new Error("binaryPath and outputPath are required.");
 
   const windows = platform === "win-x64";
-  const binaryName = windows ? "sqlserver-plugin.exe" : "sqlserver-plugin";
+  const binaryName = windows ? `${REQUIRED_EXECUTABLE}.exe` : REQUIRED_EXECUTABLE;
   const binary = await readBinary(binaryPath, windows);
   const { assetPaths } = await preflightManifest({ root, assetRoot: root });
-  const requiredSources = [
-    [".tabularium", ".tabularium", 0o644],
-    ["README.md", "README.md", 0o644],
-    ["LICENSE", "LICENSE", 0o644],
-    ["ui/dist/index.js", "ui/dist/index.js", 0o644],
-    ["explain/dist/index.iife.js", "explain/dist/index.iife.js", 0o644],
-    ["vendor/mssql-tds-preview/LICENSE", "licenses/mssql-tds-preview-MIT.txt", 0o644],
-  ];
-  for (const [manifestPath, archivePath] of assetPaths.map(value => [value, value, 0o644])) {
-    if (!requiredSources.some(([, requiredPath]) => requiredPath === archivePath)) {
-      requiredSources.push([manifestPath, archivePath, 0o644]);
-    }
-  }
+  const sources = [...new Set([...FIXED_SOURCES, ...assetPaths, ...await listAssetFiles(root)])];
 
   const entries = [{ name: binaryName, data: binary, mode: 0o755 }];
-  for (const [sourcePath, archivePath, mode] of requiredSources) {
+  for (const sourcePath of sources) {
     entries.push({
-      name: archivePath,
+      name: sourcePath,
       data: await readRegularFileUnder(root, sourcePath, "Required package file"),
-      mode,
+      mode: 0o644,
     });
   }
 
@@ -55,14 +90,8 @@ export async function packagePlugin({ root = process.cwd(), binaryPath, platform
   const digest = createHash("sha256").update(archive).digest("hex");
   const temporary = `${output}.tmp-${process.pid}`;
   const sidecarTemporary = `${sidecar}.tmp-${process.pid}`;
-  for (const destination of [output, sidecar, temporary, sidecarTemporary]) {
-    try {
-      await lstat(destination);
-      throw new Error(`Package output path already exists: ${destination}`);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
+  if (replace) await Promise.all([removeReplaceable(output), removeReplaceable(sidecar)]);
+  for (const destination of [output, sidecar, temporary, sidecarTemporary]) await assertAbsent(destination);
   let archiveCommitted = false;
   try {
     await writeFile(temporary, archive, { flag: "wx", mode: 0o644 });
@@ -82,12 +111,16 @@ function parseArguments(argv) {
   const result = {};
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--replace") {
+      result.replace = true;
+      continue;
+    }
     if (!["--root", "--binary", "--platform", "--output"].includes(argument)) {
       throw new Error(`Unknown argument: ${argument}`);
     }
     const value = argv[index + 1];
     if (!value || value.startsWith("--")) throw new Error(`${argument} requires a value.`);
-    result[argument.slice(2).replaceAll("-", "")] = value;
+    result[argument.slice(2)] = value;
     index += 1;
   }
   return result;
@@ -102,8 +135,9 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
       binaryPath: options.binary,
       platform: options.platform,
       outputPath: options.output,
+      replace: options.replace === true,
     });
-    process.stdout.write(`Package created: ${result.archivePath}\nSHA-256: ${result.sha256Path}\n`);
+    process.stdout.write(`Packaged ${result.archivePath}\nSHA-256: ${result.sha256Path}\n`);
   } catch (error) {
     process.stderr.write(`Package creation failed: ${error.message}\n`);
     process.exitCode = 1;

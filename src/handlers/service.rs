@@ -1,0 +1,435 @@
+use crate::{
+    driver::service::{
+        catalog, exact, explain, pool,
+        registry::{self, Scope},
+        row, sessions, supervise,
+        types::{self, DriverContext},
+        ServiceError,
+    },
+    models::ConnectionParams,
+};
+use mssql_tds::message::transaction_management::TransactionIsolationLevel;
+use serde_json::{json, Value};
+
+pub const METHODS: &[&str] = &[
+    "execute_query_exact",
+    "service_session_open",
+    "service_session_finish",
+    "service_session_discard",
+    "service_invalidate_auth",
+    "service_test",
+    "service_catalog",
+    "service_row",
+    "service_explain",
+    "cancel_request",
+];
+pub fn is_method(method: &str) -> bool {
+    METHODS.contains(&method)
+}
+pub fn capabilities() -> Value {
+    json!({"service_protocol":1,"exact_query":true,"exact_affected_rows":false,"sessions":true,"cancel_v1":true,"cancel":true,"entra_token":false,"catalog":true,"rows":true,"explain":true})
+}
+pub fn prepare(params: &Value) -> Result<Scope, ServiceError> {
+    let (context, _) = DriverContext::parse(params)?;
+    Scope::reserve(&context)
+}
+enum Lease {
+    Owned(Option<Box<pool::NativeConnection>>, bool),
+    Session(tokio::sync::OwnedMutexGuard<sessions::Slot>, bool),
+}
+impl Lease {
+    fn client(&mut self) -> &mut mssql_tds::connection::tds_client::TdsClient {
+        match self {
+            Self::Owned(client, _) => client.as_mut().unwrap(),
+            Self::Session(slot, _) => slot.client.as_mut().unwrap(),
+        }
+    }
+    fn completed(&mut self) {
+        match self {
+            Self::Owned(_, valid) | Self::Session(_, valid) => *valid = true,
+        }
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        match self {
+            Self::Owned(client, false) => {
+                if let Some(client) = client.take() {
+                    pool::discard(*client);
+                }
+            }
+            Self::Session(slot, false) => {
+                if let Some(client) = slot.client.take() {
+                    pool::discard(client);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+async fn acquire(
+    params: &ConnectionParams,
+    context: &DriverContext,
+    scope: &Scope,
+) -> Result<Lease, ServiceError> {
+    scope.remaining()?;
+    context.validate_auth(params)?;
+    if let Some(handle) = &context.session_handle {
+        let slot = sessions::lock(handle, params, context, scope).await?;
+        scope.touch_session();
+        Ok(Lease::Session(slot, false))
+    } else {
+        Ok(Lease::Owned(
+            Some(Box::new(pool::acquire(params, context, scope).await?)),
+            false,
+        ))
+    }
+}
+/// A connection returns to the pool only after a complete, uncancelled
+/// execution; a cancelled or truncated one is discarded.
+fn reusable(data: &Value, scope: &Scope) -> bool {
+    data["truncated"] != true && !scope.cancelled()
+}
+async fn run(
+    params: &Value,
+    method: &str,
+    context: &DriverContext,
+    connection: &ConnectionParams,
+    scope: &Scope,
+    response_overhead: usize,
+) -> Result<Value, ServiceError> {
+    if method == "service_invalidate_auth" {
+        types::only_keys(&params["input"], &[])?;
+        scope.seal();
+        registry::cancel_connection(&context.connection_id);
+        pool::invalidate(&context.connection_id).await;
+        sessions::invalidate(&context.connection_id).await;
+        return Ok(json!({"invalidated":true}));
+    }
+    if method == "service_session_open" {
+        let input: sessions::OpenInput = types::input(params)?;
+        if context.session_handle.is_some()
+            || (input.mode == sessions::Mode::ReadOnly) != context.read_only
+            || input
+                .database
+                .as_ref()
+                .is_some_and(|database| database != connection.database.primary())
+        {
+            return Err(ServiceError::argument(
+                "The session mode or database does not match this connection",
+            ));
+        }
+        let permit = sessions::reserve()?;
+        let mut lease = Lease::Owned(
+            Some(Box::new(pool::acquire(connection, context, scope).await?)),
+            false,
+        );
+        lease
+            .client()
+            .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+            .await
+            .map_err(ServiceError::database)?;
+        let transaction_id = exact::transaction_id(lease.client()).await?;
+        scope.remaining()?;
+        let Lease::Owned(client, _) = &mut lease else {
+            unreachable!()
+        };
+        let result = sessions::open(
+            *client.take().unwrap(),
+            connection,
+            context,
+            permit,
+            transaction_id,
+        )
+        .await;
+        scope.register_opened_session(result["session_handle"].as_str().unwrap());
+        return Ok(result);
+    }
+    if matches!(method, "service_session_finish" | "service_session_discard") {
+        let handle = context
+            .session_handle
+            .as_deref()
+            .ok_or_else(|| ServiceError::argument("session_handle is required"))?;
+        let mut slot = sessions::lock(handle, connection, context, scope).await?;
+        if method == "service_session_discard" {
+            types::only_keys(&params["input"], &[])?;
+            scope.touch_session();
+            if let Some(client) = slot.client.take() {
+                pool::discard(client);
+            }
+            drop(slot);
+            sessions::forget(handle).await;
+            return Ok(
+                json!({"session_handle":handle,"in_transaction":false,"rollback_confirmed":false}),
+            );
+        }
+        let input: sessions::FinishInput = types::input(params)?;
+        scope.touch_session();
+        let mut client = slot
+            .client
+            .take()
+            .ok_or_else(|| ServiceError::argument("The physical session was closed"))?;
+        if slot.dirty {
+            scope.mark_write();
+        }
+        let commit = input.action == sessions::Action::Commit;
+        let result = if commit {
+            client.commit_transaction(None, None).await
+        } else {
+            client.rollback_transaction(None, None).await
+        };
+        pool::discard(client);
+        drop(slot);
+        sessions::forget(handle).await;
+        result.map_err(|error| {
+            let mut error = ServiceError::database(error);
+            error.session_closed = true;
+            error
+        })?;
+        return Ok(
+            json!({"session_handle":handle,"in_transaction":false,"rollback_confirmed":!commit}),
+        );
+    }
+    if method == "service_explain" {
+        let input: explain::Input = types::input(params)?;
+        return explain::estimated_plan(input, context, connection, scope).await;
+    }
+    let mut row_operation = None;
+    let prepared = match method {
+        "execute_query_exact" => {
+            let input: exact::ExactInput = types::input(params)?;
+            let bindings = exact::validate(&input, context.read_only)?;
+            // The TDS client reports rows returned, not rows affected, so a
+            // write whose last statement is DML selects @@ROWCOUNT after it.
+            let counted = !context.read_only
+                && crate::driver::helpers::query_reports_affected_rows(&input.text);
+            let text = if counted {
+                crate::driver::helpers::wrap_dml_with_rowcount(&input.text)
+            } else {
+                input.text
+            };
+            (
+                text,
+                bindings,
+                input.max_rows,
+                input.max_bytes,
+                counted,
+                None,
+            )
+        }
+        "service_catalog" => {
+            let input: catalog::Input = types::input(params)?;
+            let query = catalog::query(&input, connection)?;
+            let bindings = exact::bind(&query.parameters)?;
+            (
+                query.text.clone(),
+                bindings,
+                10_000,
+                types::FRAME_LIMIT,
+                false,
+                Some(query),
+            )
+        }
+        "service_row" => {
+            if context.read_only {
+                return Err(ServiceError::new(
+                    "WRITE_NOT_ALLOWED",
+                    "Read-only context cannot edit rows",
+                ));
+            }
+            let input: row::Input = types::input(params)?;
+            let query = row::query(&input, connection)?;
+            let bindings = exact::bind(&query.parameters)?;
+            row_operation = Some(input);
+            (query.text, bindings, 10_000, types::FRAME_LIMIT, true, None)
+        }
+        "service_test" => {
+            types::only_keys(&params["input"], &[])?;
+            (
+                "SELECT 1 AS connected".to_owned(),
+                Vec::new(),
+                10_000,
+                types::FRAME_LIMIT,
+                false,
+                None,
+            )
+        }
+        _ => {
+            return Err(ServiceError::new(
+                "UNSUPPORTED_OPERATION",
+                "Unknown service operation",
+            ))
+        }
+    };
+    let mut lease = acquire(connection, context, scope).await?;
+    let cancel = scope.cancel_handle();
+    if let Some(input) = &row_operation {
+        row::validate_primary_key(lease.client(), input, &cancel).await?;
+    }
+    if let Lease::Session(slot, _) = &lease {
+        if !slot.client.as_ref().unwrap().has_active_transaction() {
+            return Err(ServiceError::new(
+                "OUTCOME_UNKNOWN",
+                "The reserved transaction is no longer active",
+            ));
+        }
+    }
+    scope.remaining()?;
+    if method == "service_row" || (method == "execute_query_exact" && !context.read_only) {
+        scope.mark_write();
+        if let Lease::Session(slot, _) = &mut lease {
+            slot.dirty = true;
+        }
+    }
+    let prefix =
+        method == "execute_query_exact" && context.read_only && context.session_handle.is_none();
+    let data = if prefix {
+        exact::collect_read_prefix(
+            lease.client(),
+            &prepared.0,
+            prepared.1,
+            cancel,
+            prepared.2,
+            prepared.3,
+            response_overhead,
+        )
+        .await?
+    } else {
+        let batch = method == "execute_query_exact" && matches!(lease, Lease::Session(..));
+        exact::collect_with(
+            lease.client(),
+            &prepared.0,
+            prepared.1,
+            Some(&cancel),
+            prepared.2,
+            prepared.3,
+            prepared.4,
+            batch,
+        )
+        .await?
+    };
+    if row_operation.is_some() && data["affected_rows"].as_u64().is_none_or(|count| count > 1) {
+        return Err(ServiceError::new(
+            "OUTCOME_UNKNOWN",
+            "The row operation did not confirm a single-row outcome",
+        ));
+    }
+    if matches!(lease, Lease::Session(..)) {
+        let current = if lease.client().has_active_transaction() {
+            Some(exact::transaction_id(lease.client()).await?)
+        } else {
+            None
+        };
+        let Lease::Session(slot, _) = &mut lease else {
+            unreachable!()
+        };
+        if current.as_ref() != Some(&slot.transaction_id) {
+            return Err(ServiceError::new(
+                "OUTCOME_UNKNOWN",
+                "The user SQL changed the reserved transaction",
+            ));
+        }
+        slot.last_used = tokio::time::Instant::now();
+    } else if lease.client().has_active_transaction() {
+        return Err(ServiceError::new(
+            "OUTCOME_UNKNOWN",
+            "User SQL opened an unmanaged transaction",
+        ));
+    }
+    if reusable(&data, scope) {
+        lease.completed();
+    }
+    Ok(if let Some(query) = prepared.5 {
+        catalog::result(&query, &data)?
+    } else if method == "service_test" {
+        json!({"success":true})
+    } else {
+        data
+    })
+}
+pub async fn dispatch(id: Value, params: &Value, method: &str, supplied: Option<Scope>) -> Value {
+    if !types::valid_rpc_id(&id) {
+        return ServiceError::argument(
+            "Service RPC id must be null, a bounded string, or a safe integer",
+        )
+        .response(Value::Null);
+    }
+    if method == "cancel_request" {
+        return supervise::acknowledge(id, params);
+    }
+    let parsed = if method == "service_invalidate_auth" {
+        DriverContext::parse_control(params).map(|context| (context, ConnectionParams::default()))
+    } else {
+        DriverContext::parse(params)
+    };
+    let (context, connection) = match parsed {
+        Ok(value) => value,
+        Err(error) => return error.response(id),
+    };
+    let scope = match supplied.map(Ok).unwrap_or_else(|| Scope::reserve(&context)) {
+        Ok(scope) => scope,
+        Err(error) => return error.response(id),
+    };
+    let response_overhead = serde_json::to_vec(&crate::rpc::ok_response(id.clone(), Value::Null))
+        .unwrap()
+        .len()
+        - 4;
+    let action = run(
+        params,
+        method,
+        &context,
+        &connection,
+        &scope,
+        response_overhead,
+    );
+    supervise::supervise(
+        id,
+        context.session_handle.as_deref(),
+        &scope,
+        action,
+        supervise::SETTLE,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope() -> Scope {
+        let context: DriverContext = serde_json::from_value(json!({"protocol_version":1,"connection_id":uuid::Uuid::new_v4().to_string(),"request_id":"reuse"})).unwrap();
+        Scope::reserve(&context).unwrap()
+    }
+
+    #[test]
+    fn 취소됐거나_잘린_실행의_연결은_pool로_돌려주지_않는다() {
+        let _gate = registry::SHUTDOWN_GATE.read().unwrap();
+        // given
+        let complete = scope();
+        let cancelled = scope();
+        let truncated = scope();
+        registry::cancel(cancelled.connection_id(), "reuse");
+
+        // when
+        let actual = [
+            reusable(&json!({"truncated":false}), &complete),
+            reusable(&json!({"truncated":false}), &cancelled),
+            reusable(&json!({"truncated":true}), &truncated),
+        ];
+
+        // then
+        assert_eq!(actual, [true, false, false]);
+    }
+
+    #[test]
+    fn service_capabilities는_host가_읽는_cancel_키를_광고한다() {
+        // given
+        let capabilities = capabilities();
+
+        // when
+        let actual = (&capabilities["cancel_v1"], &capabilities["cancel"]);
+
+        // then
+        assert_eq!(actual, (&json!(true), &json!(true)));
+    }
+}

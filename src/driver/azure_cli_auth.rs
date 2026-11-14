@@ -1,222 +1,208 @@
+//! Driver-owned Microsoft Entra user authentication through Azure CLI.
+//!
+//! The driver requests a tenant-scoped Azure SQL access token from the
+//! locally signed-in Azure CLI for every new physical connection, for both
+//! the legacy pool and the service pool. The host never supplies a token.
+//! The payload checks below validate JWT shape and identity metadata only;
+//! Azure SQL performs the cryptographic signature validation.
+
 use std::ffi::OsString;
-use std::fmt;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
-use mssql_tiberius_bridge::{AuthMethod, Config};
-use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::time::{timeout_at, Instant};
 
+use crate::connection::resolve_connection_params;
 use crate::models::ConnectionParams;
+use crate::settings::PluginSettings;
 
-const SQL_RESOURCE: &str = "https://database.windows.net/";
-const MAX_STDOUT_BYTES: usize = 1024 * 1024;
-const MAX_STDERR_BYTES: usize = 64 * 1024;
+const RESOURCE: &str = "https://database.windows.net/";
+const DEFAULT_AZURE_CLI_PATH: &str = "az";
+const EXPIRY_SAFETY_SECONDS: u64 = 120;
+const MAX_CLI_OUTPUT_BYTES: usize = 64 * 1024;
+const TOKEN_REQUEST_FAILED: &str = "Azure CLI token request failed";
+const INVALID_RESPONSE: &str = "Azure CLI returned an invalid token response";
+const INVALID_TOKEN: &str = "Azure CLI returned an invalid access token";
+const DIFFERENT_IDENTITY: &str = "Azure CLI returned a token for a different identity";
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[derive(Clone)]
+/// Program and leading arguments that launch Azure CLI without a shell.
+#[derive(Debug, PartialEq, Eq)]
 struct CliCommand {
-    identity_path: PathBuf,
     program: PathBuf,
     prefix_args: Vec<OsString>,
 }
 
 impl CliCommand {
-    fn direct(path: PathBuf) -> Self {
+    fn direct(program: PathBuf) -> Self {
         Self {
-            identity_path: path.clone(),
-            program: path,
+            program,
             prefix_args: Vec::new(),
         }
     }
 }
 
-#[derive(Clone)]
+/// Expected Entra principal and the CLI used to obtain its token.
+/// It never holds a token, so its Debug output is safe to log.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AzureCliAuth {
-    username: String,
-    tenant_id: String,
-    object_id: String,
-    cli: CliCommand,
+    pub tenant_id: String,
+    pub entra_object_id: String,
+    pub username: String,
+    pub azure_cli_path: String,
 }
 
-impl fmt::Debug for AzureCliAuth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AzureCliAuth")
-            .field("identity", &"[redacted]")
-            .field("executable", &self.cli.identity_path)
-            .finish()
+/// A validated access token. Debug output is redacted and the value is only
+/// reachable through `expose`, which callers hand to the TDS login.
+pub struct AccessToken(String);
+
+impl AccessToken {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccessToken(<redacted>)")
     }
 }
 
 impl AzureCliAuth {
-    pub fn from_params(params: &ConnectionParams) -> Result<Option<Self>, String> {
-        let mode = params.extra.get("auth_mode").map(String::as_str);
-        match mode {
-            None => {
-                if params.extra.contains_key("auth_source") {
-                    return Err("SQL Server auth_source requires auth_mode".into());
-                }
-                Ok(None)
-            }
-            Some("entra_user") => {
-                let source = params
-                    .extra
-                    .get("auth_source")
-                    .map(String::as_str)
-                    .ok_or_else(|| "Entra user authentication requires auth_source".to_owned())?;
-                if source != "azure_cli" {
-                    return Err("unsupported Entra authentication source".into());
-                }
-
-                if params.integrated_auth {
-                    return Err(
-                        "Entra user authentication cannot use integrated authentication".into(),
-                    );
-                }
-                if params
-                    .password
-                    .as_deref()
-                    .is_some_and(|password| !password.is_empty())
-                {
-                    return Err("Entra user authentication cannot include a password".into());
-                }
-
-                let username = required_identity_field(params.username.as_deref(), "username")?;
-                let tenant_id = required_extra_field(params, "tenant_id")?;
-                let object_id = required_extra_field(params, "entra_object_id")?;
-                let executable = match params.extra.get("azure_cli_path") {
-                    Some(path) if !path.trim().is_empty() => {
-                        let path = PathBuf::from(path.trim());
-                        if !path.is_absolute() {
-                            return Err("azure_cli_path must be an absolute path".into());
-                        }
-                        path
-                    }
-                    _ => PathBuf::from("az"),
-                };
-                let mut cli = resolve_cli_command(
-                    params
-                        .extra
-                        .get("azure_cli_path")
-                        .filter(|path| !path.trim().is_empty())
-                        .map(|_| executable.as_path()),
-                )
-                .map_err(|_| "Azure CLI executable could not be resolved".to_owned())?;
-                cli.identity_path = executable;
-
-                Ok(Some(Self {
-                    username,
-                    tenant_id,
-                    object_id,
-                    cli,
-                }))
-            }
-            Some(_) => Err("unsupported SQL Server authentication mode".into()),
-        }
-    }
-
-    pub fn validate_connection(
-        &self,
+    /// Returns `Ok(None)` for non-Entra connections and the validated identity
+    /// for `auth_mode=entra_user`.
+    pub fn from_connection_params(
         params: &ConnectionParams,
-        trust_server_certificate: bool,
-    ) -> Result<(), String> {
-        if !params.host.as_deref().is_some_and(is_public_azure_sql_host) {
-            return Err("Entra user authentication requires a public Azure SQL host".into());
+        settings: &PluginSettings,
+    ) -> Result<Option<Self>, String> {
+        let params = resolve_connection_params(params)?;
+        if params.auth_mode.as_deref() != Some("entra_user") {
+            return Ok(None);
+        }
+        let source = params.extra.get("auth_source").map(String::as_str);
+        if source.map(str::trim) != Some("azure_cli") {
+            return Err("unsupported SQL Server auth_source".into());
+        }
+        if params.integrated_auth {
+            return Err(
+                "SQL Server Entra authentication cannot be combined with integrated authentication"
+                    .into(),
+            );
+        }
+        if params
+            .password
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(
+                "SQL Server Entra authentication cannot be combined with a password".into(),
+            );
+        }
+
+        let username = params
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "SQL Server Entra authentication requires a username".to_string())?;
+        let tenant_id = required_extra(&params, "tenant_id")?;
+        if !valid_tenant(&tenant_id) {
+            return Err("SQL Server Entra authentication has an invalid tenant_id".into());
+        }
+        let entra_object_id = required_extra(&params, "entra_object_id")?;
+        if !is_public_azure_sql_host(params.host.as_deref()) {
+            return Err(
+                "SQL Server Entra authentication requires an Azure SQL database.windows.net host"
+                    .into(),
+            );
         }
         if params.ssl_mode.as_deref() != Some("verify-full") {
-            return Err("Entra user authentication requires ssl_mode 'verify-full'".into());
+            return Err("SQL Server Entra authentication requires ssl_mode=verify-full".into());
         }
-        if trust_server_certificate {
-            return Err("Entra user authentication requires trust_server_certificate=false".into());
+        if settings.trust_server_certificate {
+            return Err(
+                "SQL Server Entra authentication requires trust_server_certificate=false".into(),
+            );
         }
-        Ok(())
+
+        let azure_cli_path = match params.extra.get("azure_cli_path") {
+            Some(value) if !value.is_empty() && value.trim() == value && is_absolute(value) => {
+                value.clone()
+            }
+            Some(_) => {
+                return Err("azure_cli_path must be a nonempty absolute path".into());
+            }
+            None => DEFAULT_AZURE_CLI_PATH.to_owned(),
+        };
+
+        Ok(Some(Self {
+            tenant_id,
+            entra_object_id,
+            username: username.to_owned(),
+            azure_cli_path,
+        }))
     }
 
-    pub fn identity_key(&self) -> String {
-        format!(
-            "entra_user:azure_cli:tenant={}:{}:object_id={}:{}:username={}:{}:cli={}:{}",
-            self.tenant_id.len(),
-            self.tenant_id,
-            self.object_id.len(),
-            self.object_id,
-            self.username.len(),
-            self.username,
-            self.cli.identity_path.to_string_lossy().len(),
-            self.cli.identity_path.display()
-        )
-    }
-
-    pub async fn acquire_access_token(&self, deadline: Instant) -> Result<String, AcquireError> {
-        let mut child = build_cli_command(&self.cli)
+    /// Run Azure CLI without a shell and return a validated token. Output is
+    /// captured privately and never surfaced; dropping the future (deadline,
+    /// cancellation) kills the child process.
+    pub async fn acquire_access_token(&self) -> Result<AccessToken, &'static str> {
+        let explicit = (self.azure_cli_path != DEFAULT_AZURE_CLI_PATH)
+            .then(|| Path::new(&self.azure_cli_path));
+        let cli = resolve_cli_command(explicit).map_err(|_| TOKEN_REQUEST_FAILED)?;
+        let output = build_cli_command(&cli)
             .args([
                 "account",
                 "get-access-token",
                 "--resource",
-                SQL_RESOURCE,
+                RESOURCE,
                 "--tenant",
-                self.tenant_id.as_str(),
-                "--output",
-                "json",
             ])
+            .arg(&self.tenant_id)
+            .args(["--output", "json"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| AcquireError::Failed("Azure CLI could not be started"))?;
-
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
-        let output = async {
-            let stdout = read_bounded(stdout, MAX_STDOUT_BYTES);
-            let stderr = read_bounded(stderr, MAX_STDERR_BYTES);
-            let status = child.wait();
-            tokio::join!(stdout, stderr, status)
-        };
-
-        let (stdout, stderr, status) = match timeout_at(deadline, output).await {
-            Ok((Ok(stdout), Ok(stderr), Ok(status))) => (stdout, stderr, status),
-            Ok(_) => return Err(AcquireError::Failed("Azure CLI process failed")),
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(AcquireError::Timeout);
-            }
-        };
-
-        if !status.success() {
-            return Err(AcquireError::Failed("Azure CLI token acquisition failed"));
+            .output()
+            .await
+            .map_err(|_| TOKEN_REQUEST_FAILED)?;
+        if !output.status.success() {
+            return Err(TOKEN_REQUEST_FAILED);
         }
-        if stdout.1 || stderr.1 {
-            return Err(AcquireError::Failed(
-                "Azure CLI output exceeded the allowed size",
-            ));
+        if output.stdout.len() > MAX_CLI_OUTPUT_BYTES {
+            return Err(INVALID_RESPONSE);
         }
 
-        let output: CliTokenOutput = serde_json::from_slice(&stdout.0)
-            .map_err(|_| AcquireError::Failed("Azure CLI returned invalid token data"))?;
-        validate_access_token(
-            &output.access_token,
-            &self.tenant_id,
-            &self.object_id,
-            &self.username,
-            chrono::Utc::now().timestamp(),
-        )
-        .map_err(AcquireError::Failed)?;
-        Ok(output.access_token)
+        let response: Value =
+            serde_json::from_slice(&output.stdout).map_err(|_| INVALID_RESPONSE)?;
+        let token = response
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or(INVALID_RESPONSE)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "System clock is before the Unix epoch")?
+            .as_secs();
+        validate_access_token(token, self, now)?;
+        Ok(AccessToken(token.to_owned()))
     }
 
-    pub fn apply_token(&self, config: &mut Config, token: String) {
-        config.authentication(AuthMethod::aad_token(token));
+    /// Non-secret identity material for pool keys and fingerprints.
+    pub fn identity_parts(&self) -> [&str; 5] {
+        [
+            "azure_cli",
+            &self.tenant_id,
+            &self.entra_object_id,
+            &self.username,
+            &self.azure_cli_path,
+        ]
     }
 }
 
@@ -240,12 +226,14 @@ fn resolve_cli_command(explicit_path: Option<&Path>) -> Result<CliCommand, &'sta
     {
         Ok(CliCommand::direct(
             explicit_path
-                .unwrap_or_else(|| Path::new("az"))
+                .unwrap_or_else(|| Path::new(DEFAULT_AZURE_CLI_PATH))
                 .to_path_buf(),
         ))
     }
 }
 
+/// Windows cannot start `az.cmd` without a shell, so the official launcher is
+/// replaced by the Python runtime next to its `wbin` directory.
 #[cfg(any(windows, test))]
 fn resolve_windows_cli(
     explicit_path: Option<&Path>,
@@ -320,183 +308,104 @@ fn resolve_azure_cli_cmd(path: &Path) -> Result<CliCommand, &'static str> {
         .filter(|python| python.is_file())
         .ok_or("Azure CLI Python runtime was not found")?;
     Ok(CliCommand {
-        identity_path: path.to_path_buf(),
         program: python,
         prefix_args: vec![OsString::from("-IBm"), OsString::from("azure.cli")],
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum AcquireError {
-    Failed(&'static str),
-    Timeout,
+fn is_absolute(value: &str) -> bool {
+    Path::new(value).is_absolute()
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CliTokenOutput {
-    access_token: String,
-}
-
-async fn read_bounded(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut output = Vec::with_capacity(limit.min(8192));
-    let mut overflow = false;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        let available = limit.saturating_sub(output.len());
-        let retained = count.min(available);
-        output.extend_from_slice(&buffer[..retained]);
-        overflow |= retained < count;
-    }
-    Ok((output, overflow))
-}
-
-pub fn validate_access_token(
-    token: &str,
-    expected_tenant: &str,
-    expected_object_id: &str,
-    expected_username: &str,
-    now_epoch_seconds: i64,
-) -> Result<(), &'static str> {
-    let mut parts = token.split('.');
-    let (Some(header), Some(payload), Some(signature), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err("Azure CLI returned an invalid access token");
-    };
-    if header.is_empty() || payload.is_empty() || signature.is_empty() {
-        return Err("Azure CLI returned an invalid access token");
-    }
-
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(header)
-        .map_err(|_| "Azure CLI returned an invalid access token")?;
-    let header: Value = serde_json::from_slice(&header_bytes)
-        .map_err(|_| "Azure CLI returned an invalid access token")?;
-    let algorithm = header.get("alg").and_then(Value::as_str);
-    if !header.is_object()
-        || !algorithm.is_some_and(|algorithm| {
-            !algorithm.is_empty() && !algorithm.eq_ignore_ascii_case("none")
+fn is_public_azure_sql_host(host: Option<&str>) -> bool {
+    host.filter(|value| value.trim() == *value)
+        .and_then(|host| {
+            host.to_ascii_lowercase()
+                .strip_suffix(".database.windows.net")
+                .map(|prefix| !prefix.is_empty())
         })
+        .unwrap_or(false)
+}
+
+fn valid_tenant(value: &str) -> bool {
+    !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+}
+
+fn required_extra(params: &ConnectionParams, key: &str) -> Result<String, String> {
+    params
+        .extra
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("SQL Server Entra authentication requires {key}"))
+}
+
+fn validate_access_token(token: &str, auth: &AzureCliAuth, now: u64) -> Result<(), &'static str> {
+    let mut segments = token.split('.');
+    let (Some(header), Some(payload), Some(signature)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return Err(INVALID_TOKEN);
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || segments.next().is_some()
     {
-        return Err("Azure CLI returned an invalid access token");
+        return Err(INVALID_TOKEN);
     }
-    URL_SAFE_NO_PAD
-        .decode(signature)
-        .map_err(|_| "Azure CLI returned an invalid access token")?;
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(payload)
-        .map_err(|_| "Azure CLI returned an invalid access token")?;
-    let claims: Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|_| "Azure CLI returned an invalid access token")?;
-    let claims = claims
-        .as_object()
-        .ok_or("Azure CLI returned an invalid access token")?;
+        .or_else(|_| URL_SAFE.decode(payload))
+        .map_err(|_| INVALID_TOKEN)?;
+    let claims: Value = serde_json::from_slice(&payload_bytes).map_err(|_| INVALID_TOKEN)?;
 
-    if !claim_matches(claims.get("tid"), expected_tenant) {
-        return Err("Azure CLI token tenant does not match the configured identity");
+    if !claim_string_matches(&claims, "tid", &auth.tenant_id)
+        || !claim_string_matches(&claims, "oid", &auth.entra_object_id)
+    {
+        return Err(DIFFERENT_IDENTITY);
     }
-    if !claim_matches(claims.get("oid"), expected_object_id) {
-        return Err("Azure CLI token principal does not match the configured identity");
-    }
-    for name in ["upn", "unique_name", "preferred_username"] {
-        if let Some(value) = claims.get(name) {
-            if !claim_matches(Some(value), expected_username) {
-                return Err("Azure CLI token username does not match the configured identity");
-            }
+    for key in ["upn", "unique_name", "preferred_username"] {
+        if claims.get(key).is_some_and(|value| {
+            !value
+                .as_str()
+                .is_some_and(|claim| claim.eq_ignore_ascii_case(&auth.username))
+        }) {
+            return Err(DIFFERENT_IDENTITY);
         }
     }
-    if !audience_matches(claims.get("aud")) {
-        return Err("Azure CLI token audience is not Azure SQL");
+
+    let audience_matches = claims
+        .get("aud")
+        .and_then(Value::as_str)
+        .is_some_and(|aud| aud == RESOURCE || aud == RESOURCE.trim_end_matches('/'));
+    if !audience_matches {
+        return Err("Azure CLI returned a token for a different resource");
     }
 
-    let expiry = claims
+    let valid_until = now.saturating_add(EXPIRY_SAFETY_SECONDS);
+    if claims
         .get("exp")
-        .and_then(Value::as_i64)
-        .ok_or("Azure CLI token has no valid expiry")?;
-    if expiry <= now_epoch_seconds.saturating_add(120) {
-        return Err("Azure CLI token expires too soon");
+        .and_then(Value::as_u64)
+        .is_none_or(|expires| expires <= valid_until)
+    {
+        return Err("Azure CLI returned an expired or near-expiry token");
     }
+
     Ok(())
 }
 
-fn claim_matches(value: Option<&Value>, expected: &str) -> bool {
-    value
+fn claim_string_matches(claims: &Value, key: &str, expected: &str) -> bool {
+    claims
+        .get(key)
         .and_then(Value::as_str)
-        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
-fn audience_matches(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::String(audience)) => audience == SQL_RESOURCE,
-        Some(Value::Array(audiences)) => audiences
-            .iter()
-            .any(|audience| audience.as_str() == Some(SQL_RESOURCE)),
-        _ => false,
-    }
-}
-
-fn required_identity_field(value: Option<&str>, name: &str) -> Result<String, String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| format!("Entra user authentication requires {name}"))
-}
-
-fn required_extra_field(params: &ConnectionParams, name: &str) -> Result<String, String> {
-    required_identity_field(params.extra.get(name).map(String::as_str), name)
-}
-
-fn is_public_azure_sql_host(host: &str) -> bool {
-    let host = host.trim().trim_end_matches('.');
-    host.len() > ".database.windows.net".len()
-        && host.to_ascii_lowercase().ends_with(".database.windows.net")
-}
-
-pub async fn connect_with_auth<T, E, F, Fut>(
-    config: &Config,
-    auth: Option<&AzureCliAuth>,
-    connect_timeout: Duration,
-    connector: F,
-) -> Result<T, ConnectError<E>>
-where
-    F: FnOnce(Config) -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
-    let deadline = Instant::now() + connect_timeout;
-    let mut connection_config = config.clone();
-    if let Some(auth) = auth {
-        let token = auth
-            .acquire_access_token(deadline)
-            .await
-            .map_err(|error| match error {
-                AcquireError::Failed(message) => ConnectError::Authentication(message),
-                AcquireError::Timeout => ConnectError::Timeout,
-            })?;
-        auth.apply_token(&mut connection_config, token);
-    }
-
-    timeout_at(deadline, connector(connection_config))
-        .await
-        .map_err(|_| ConnectError::Timeout)?
-        .map_err(ConnectError::Connect)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ConnectError<E> {
-    Authentication(&'static str),
-    Timeout,
-    Connect(E),
-}
+#[cfg(test)]
+pub(crate) mod fake_cli;
 
 #[cfg(test)]
 mod tests;

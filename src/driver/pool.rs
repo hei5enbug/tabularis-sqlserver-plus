@@ -4,7 +4,9 @@
 //! protocol implementation behind a tiberius-compatible API) via a custom
 //! deadpool manager.
 //!
-//! Auth is username/password or Windows/Kerberos (`integrated_auth`). TLS
+//! Auth is username/password, Windows/Kerberos (`integrated_auth`), or
+//! Entra user authentication through Azure CLI (`auth_mode=entra_user`), where
+//! the manager acquires a fresh token for every new physical connection. TLS
 //! uses Tabularis' shared `ssl_mode`: `disable` turns encryption off,
 //! `verify-full` requires the system trust store and hostname verification,
 //! `require` encrypts while accepting the server certificate, and `prefer`
@@ -14,11 +16,12 @@ use std::future::Future;
 use std::time::Duration;
 
 use crate::connection::{custom_ca_error, resolve_connection_params};
-use crate::driver::azure_cli_auth::{self, AzureCliAuth, ConnectError};
+use crate::driver::azure_cli_auth::AzureCliAuth;
 use crate::driver::error::{bridge_error_requires_discard, format_bridge_error};
 use crate::models::ConnectionParams;
 use crate::settings::PluginSettings;
 use deadpool::managed::{Manager, Metrics, RecycleError, RecycleResult};
+use mssql_tds::connection::tds_client::ResultSetClient;
 use mssql_tiberius_bridge::TdsClient;
 use mssql_tiberius_bridge::{
     AuthMethod, Client, Config, EncryptionLevel, Error, ExecuteResult, QueryResult, ToSql,
@@ -31,7 +34,12 @@ pub struct BridgeConnection {
     query_timeout_seconds: Option<u32>,
     ssl_mode: String,
     recyclable: bool,
+    batch_left_open: bool,
 }
+
+const BATCH_LEFT_OPEN_ERROR: &str =
+    "SQL Server: an earlier statement failed while returning rows and \
+     left this connection unusable; run this statement again";
 
 impl BridgeConnection {
     async fn with_query_timeout<T>(
@@ -54,6 +62,7 @@ impl BridgeConnection {
     }
 
     pub async fn simple_query(&mut self, sql: impl Into<String>) -> Result<QueryResult, String> {
+        self.ensure_usable()?;
         let result = self.simple_query_raw(sql).await;
         self.discard_if_transaction_open();
         self.format_result(result)
@@ -64,6 +73,7 @@ impl BridgeConnection {
         sql: impl Into<String>,
         params: &[&dyn ToSql],
     ) -> Result<QueryResult, String> {
+        self.ensure_usable()?;
         let operation = self.client.query(sql.into(), params);
         let result = Self::with_query_timeout(self.query_timeout_seconds, operation).await;
         self.discard_if_transaction_open();
@@ -75,16 +85,40 @@ impl BridgeConnection {
         sql: impl Into<String>,
         params: &[&dyn ToSql],
     ) -> Result<ExecuteResult, String> {
+        self.ensure_usable()?;
         let operation = self.client.execute(sql.into(), params);
         let result = Self::with_query_timeout(self.query_timeout_seconds, operation).await;
         self.discard_if_transaction_open();
         self.format_result(result)
     }
 
-    pub(crate) fn discard_if_transaction_open(&mut self) {
+    /// Close this session instead of returning it to the pool.
+    pub fn discard(&mut self) {
+        self.recyclable = false;
+    }
+
+    fn discard_if_transaction_open(&mut self) {
         if self.client.inner_mut().has_active_transaction() {
             self.recyclable = false;
         }
+    }
+
+    /// mssql-tds keeps a batch marked open when an ERROR token arrives between
+    /// rows, although it has already read the batch to its end. Draining that
+    /// batch waits for tokens that never come, so the connection is not used
+    /// again, not even by a later statement of the same request.
+    pub fn discard_if_batch_left_open(&mut self) {
+        if self.client.inner_mut().get_current_resultset().is_some() {
+            self.batch_left_open = true;
+            self.recyclable = false;
+        }
+    }
+
+    pub fn ensure_usable(&self) -> Result<(), String> {
+        if self.batch_left_open {
+            return Err(BATCH_LEFT_OPEN_ERROR.to_string());
+        }
+        Ok(())
     }
 
     fn format_result<T>(&mut self, result: Result<T, Error>) -> Result<T, String> {
@@ -97,6 +131,7 @@ impl BridgeConnection {
                 // to issue reset commands into an errored transaction stream.
                 self.recyclable = false;
             }
+            self.discard_if_batch_left_open();
             format_bridge_error(&error, Some(&self.ssl_mode))
         })
     }
@@ -109,46 +144,61 @@ impl BridgeConnection {
         self.query_timeout_seconds
     }
 
-    /// Prevents a client whose TDS stream may be incomplete from returning to
-    /// the pool when this object is dropped.
-    pub fn discard(&mut self) {
-        self.recyclable = false;
-    }
-
     pub fn ssl_mode(&self) -> &str {
         &self.ssl_mode
     }
 }
 
 /// Deadpool `Manager` for bridge connections.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct BridgeManager {
     config: Config,
-    entra_auth: Option<AzureCliAuth>,
     startup_script: Option<String>,
     ssl_mode: String,
     connect_timeout: Duration,
     query_timeout_seconds: Option<u32>,
+    azure_cli_auth: Option<AzureCliAuth>,
 }
 
 impl BridgeManager {
     pub fn new(
         config: Config,
-        entra_auth: Option<AzureCliAuth>,
         startup_script: Option<String>,
         ssl_mode: &str,
         settings: &PluginSettings,
     ) -> Self {
         Self {
             config,
-            entra_auth,
             startup_script,
             ssl_mode: ssl_mode.to_owned(),
             connect_timeout: Duration::from_secs(u64::from(settings.connect_timeout_seconds)),
             query_timeout_seconds: settings
                 .query_timeout()
                 .map(|_| settings.query_timeout_seconds),
+            azure_cli_auth: None,
         }
+    }
+
+    /// Acquire an Entra token through Azure CLI for each new physical
+    /// connection instead of using the SQL credentials in the base config.
+    pub fn with_azure_cli_auth(mut self, auth: AzureCliAuth) -> Self {
+        self.azure_cli_auth = Some(auth);
+        self
+    }
+
+    /// Config for one new physical connection. The token lives only in the
+    /// returned clone and is never stored in the manager.
+    async fn connection_config(&self) -> Result<Config, Error> {
+        let Some(auth) = &self.azure_cli_auth else {
+            return Ok(self.config.clone());
+        };
+        let token = auth
+            .acquire_access_token()
+            .await
+            .map_err(|message| Error::Conversion(message.into()))?;
+        let mut config = self.config.clone();
+        config.authentication(AuthMethod::aad_token(token.expose()));
+        Ok(config)
     }
 
     async fn apply_startup_script(&self, conn: &mut BridgeConnection) -> Result<(), Error> {
@@ -165,35 +215,40 @@ impl Manager for BridgeManager {
     type Error = Error;
 
     async fn create(&self) -> Result<Self::Type, Self::Error> {
-        let client = azure_cli_auth::connect_with_auth(
-            &self.config,
-            self.entra_auth.as_ref(),
-            self.connect_timeout,
-            |config| async move { Client::connect(&config).await },
-        )
-        .await
-        .map_err(|error| match error {
-            ConnectError::Authentication(message) => Error::Conversion(message.into()),
-            ConnectError::Timeout => Error::Conversion(format!(
+        let connect = async {
+            let config = self.connection_config().await?;
+            if self.azure_cli_auth.is_some() {
+                Client::connect(&config)
+                    .await
+                    .map_err(|_| Error::Conversion("SQL Server connection failed".into()))
+            } else {
+                Client::connect(&config).await
+            }
+        };
+        let client = timeout(self.connect_timeout, connect).await.map_err(|_| {
+            Error::Conversion(format!(
                 "Connection timed out after {} seconds",
                 self.connect_timeout.as_secs()
-            )),
-            ConnectError::Connect(error) => error,
-        })?;
+            ))
+        })??;
         let mut connection = BridgeConnection {
             client,
             query_timeout_seconds: self.query_timeout_seconds,
             ssl_mode: self.ssl_mode.clone(),
             recyclable: true,
+            batch_left_open: false,
         };
         self.apply_startup_script(&mut connection).await?;
         Ok(connection)
     }
 
     async fn recycle(&self, conn: &mut Self::Type, _: &Metrics) -> RecycleResult<Self::Error> {
-        if !conn.recyclable || conn.client.inner_mut().has_active_transaction() {
+        if !conn.recyclable
+            || conn.client.inner_mut().has_active_transaction()
+            || conn.client.inner_mut().get_current_resultset().is_some()
+        {
             return Err(RecycleError::message(
-                "connection was discarded after an error, timeout, transport failure, or open transaction",
+                "connection was discarded after an error, timeout, transport failure, open transaction, or unfinished result stream",
             ));
         }
 
@@ -226,22 +281,25 @@ impl Manager for BridgeManager {
 ///
 /// Consumes the shared connection fields used by current Tabularis drivers.
 /// Uses `AuthMethod::Integrated` when `integrated_auth` is set, else
-/// username/password. TLS maps `ssl_mode` onto the bridge's encryption policy.
+/// username/password. `entra_user` validates its Azure CLI settings and leaves
+/// an empty token placeholder that `BridgeManager` replaces per connection, so
+/// a bypassed manager fails instead of falling back to SQL authentication.
+/// TLS maps `ssl_mode` onto the bridge's encryption policy.
 pub fn build_config(
     params: &ConnectionParams,
     settings: &PluginSettings,
 ) -> Result<Config, String> {
     let params = resolve_connection_params(params)?;
-    let entra_auth = AzureCliAuth::from_params(&params)?;
-    if let Some(auth) = &entra_auth {
-        auth.validate_connection(&params, settings.trust_server_certificate)?;
+    if crate::connection::is_azure_sql(&params) && settings.trust_server_certificate {
+        return Err("Azure SQL cannot trust an unverified server certificate".into());
     }
+    let entra = AzureCliAuth::from_connection_params(&params, settings)?.is_some();
     let mut cfg = Config::new();
     cfg.host(params.host.as_deref().unwrap_or("localhost"));
     cfg.port(params.port.unwrap_or(1433));
     cfg.database(params.database.primary());
-    if entra_auth.is_some() {
-        cfg.authentication(AuthMethod::sql_server("", ""));
+    if entra {
+        cfg.authentication(AuthMethod::aad_token(""));
     } else if params.integrated_auth {
         cfg.authentication(AuthMethod::Integrated);
     } else {
@@ -301,27 +359,6 @@ pub fn build_config(
     }
 
     Ok(cfg)
-}
-
-impl std::fmt::Debug for BridgeManager {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BridgeManager")
-            .field("config", &"[redacted]")
-            .field(
-                "auth_mode",
-                &if self.entra_auth.is_some() {
-                    "entra_user"
-                } else {
-                    "existing"
-                },
-            )
-            .field("startup_script", &self.startup_script.is_some())
-            .field("ssl_mode", &self.ssl_mode)
-            .field("connect_timeout", &self.connect_timeout)
-            .field("query_timeout_seconds", &self.query_timeout_seconds)
-            .finish()
-    }
 }
 
 #[cfg(test)]

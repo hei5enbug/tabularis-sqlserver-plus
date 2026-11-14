@@ -1,25 +1,32 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
-  <img src="https://raw.githubusercontent.com/hei5enbug/tabularis-sqlserver-plus/main/sqlserver-icon.svg" width="120" height="120" alt="SQL Server Plus plugin icon" />
+  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/sqlserver-icon.svg" width="120" height="120" alt="SQL Server plugin icon" />
 </div>
 
-# Tabularis SQL Server Plus
+# tabularis-sqlserver-plugin
 
 <p align="center">
 
-![Release](https://img.shields.io/github/release/hei5enbug/tabularis-sqlserver-plus.svg?style=flat)
-![Downloads](https://img.shields.io/github/downloads/hei5enbug/tabularis-sqlserver-plus/total.svg?style=flat)
-![Build & Release](https://github.com/hei5enbug/tabularis-sqlserver-plus/actions/workflows/release.yml/badge.svg)
+![Release](https://img.shields.io/github/release/TabularisDB/tabularis-sqlserver-plugin.svg?style=flat)
+![Downloads](https://img.shields.io/github/downloads/TabularisDB/tabularis-sqlserver-plugin/total.svg?style=flat)
+![Build & Release](https://github.com/tabularisDB/tabularis-sqlserver-plugin/workflows/Release/badge.svg)
 [![Discord](https://img.shields.io/discord/1502944695808950282?color=5865F2&logo=discord&logoColor=white)](https://discord.com/invite/K2hmhfHRSt)
 
 </p>
 
-A [Microsoft SQL Server](https://www.microsoft.com/sql-server) driver for [Tabularis Extended](https://github.com/hei5enbug/tabularis-host), the Tabularis desktop application fork.
+A [Microsoft SQL Server](https://www.microsoft.com/sql-server) plugin for [Tabularis](https://github.com/TabularisDB/tabularis), the lightweight database management tool.
 
-This fork keeps the SQL Server driver features and adds Windows/Kerberos and Microsoft Entra user authentication through Azure CLI, plus server-confirmed query cancellation. It provides schema introspection, query execution, full CRUD, DDL, trigger and stored-routine management, BLOB handling, database-user management, and visual execution plans through JSON-RPC 2.0 over stdio. It is written in Rust on Microsoft's [`mssql-tds`](https://github.com/microsoft/mssql-rust) protocol implementation (via [`mssql-tiberius-bridge`](https://crates.io/crates/mssql-tiberius-bridge)) with [`deadpool`](https://crates.io/crates/deadpool) connection pooling.
+This plugin enables Tabularis to connect to SQL Server instances, providing schema introspection, query execution, full CRUD, DDL, trigger and stored-routine management, BLOB handling, database-user management, and visual execution plans through a JSON-RPC 2.0 over stdio interface. It is written in Rust on top of Microsoft's [`mssql-tds`](https://github.com/microsoft/mssql-rust) protocol implementation (via [`mssql-tiberius-bridge`](https://crates.io/crates/mssql-tiberius-bridge)) with [`deadpool`](https://crates.io/crates/deadpool) connection pooling.
 
-> **Requires Tabularis Extended 0.27.0 or later.** The connection extension
-> uses the host's password-only field visibility API for Entra user sign-in.
+> **Requires Tabularis Extended `0.27.0` or later.** This fork ships the
+> package as `sqlserver-plus` (manifest `id`, display name *SQL Server Plus*,
+> executable `sqlserver-plugin`) with version `1.0.0-beta.3+plus.1` and
+> `min_runtime_version` `0.27.0`. The host maps existing `sqlserver` and
+> `sqlserver-entra` connections to `sqlserver-plus` after this package is
+> installed; the official app, its profile and the old packages stay untouched
+> for rollback. The connection-modal UI also needs the host's
+> `setPasswordFieldHidden` extension and shows a compatible-host notice when it
+> is missing.
 
 **Discord** — [Join our Discord server](https://discord.com/invite/K2hmhfHRSt) and chat with the maintainers.
 
@@ -64,12 +71,12 @@ This fork keeps the SQL Server driver features and adds Windows/Kerberos and Mic
 
 <table>
 <tr>
-<td><img src="https://raw.githubusercontent.com/hei5enbug/tabularis-sqlserver-plus/main/assets/screenshots/02-database-picker.png" alt="SQL Server listed in the database picker" width="400" /><br />SQL Server in the database picker</td>
-<td><img src="https://raw.githubusercontent.com/hei5enbug/tabularis-sqlserver-plus/main/assets/screenshots/03-connection-form.png" alt="SQL Server connection configuration form" width="400" /><br />Connection configuration</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/assets/screenshots/02-database-picker.png" alt="SQL Server listed in the database picker" width="400" /><br />SQL Server in the database picker</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/assets/screenshots/03-connection-form.png" alt="SQL Server connection configuration form" width="400" /><br />Connection configuration</td>
 </tr>
 <tr>
-<td><img src="https://raw.githubusercontent.com/hei5enbug/tabularis-sqlserver-plus/main/assets/screenshots/06-schema-browser.png" alt="SQL Server schema browser with tables, views, routines, and triggers" width="400" /><br />Multi-schema browsing</td>
-<td><img src="https://raw.githubusercontent.com/hei5enbug/tabularis-sqlserver-plus/main/assets/screenshots/08-visual-explain.png" alt="Visual EXPLAIN graph of a SQL Server SHOWPLAN" width="400" /><br />Visual EXPLAIN for SHOWPLAN</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/assets/screenshots/06-schema-browser.png" alt="SQL Server schema browser with tables, views, routines, and triggers" width="400" /><br />Multi-schema browsing</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/assets/screenshots/08-visual-explain.png" alt="Visual EXPLAIN graph of a SQL Server SHOWPLAN" width="400" /><br />Visual EXPLAIN for SHOWPLAN</td>
 </tr>
 </table>
 
@@ -136,25 +143,6 @@ are redacted in contradiction errors.
 verify the certificate map to `verify-full`. Custom CA and client-certificate
 keywords are rejected under the same limitations as their discrete-field
 counterparts.
-
-### Entra user authentication through Azure CLI
-
-Choose **Entra user (Azure CLI)** in the connection form. Keep the Username
-field set to the expected Entra user principal name, then provide `tenant_id`
-and `entra_object_id` in the extension fields. The optional `azure_cli_path`
-must be an absolute path to the Azure CLI executable; leave it blank to use
-`az` from the plugin process's `PATH`. Sign in with `az login --tenant
-<tenant-id>` before connecting and complete any required MFA in Azure CLI.
-The plugin runs Azure CLI without a shell and does not store the returned
-access token.
-
-Entra user connections require a public Azure SQL hostname ending in
-`.database.windows.net`, `ssl_mode=verify-full`, and
-`trust_server_certificate=false`. Private Link hostnames, service principals,
-managed identities, password login, and custom certificate overrides are not
-part of this authentication mode. Each new physical SQL connection obtains a
-fresh token and validates its tenant, object ID, username, audience, and
-expiration before opening the SQL session.
 
 ### TLS modes
 
@@ -317,67 +305,42 @@ Tabularis v0.23.0 or later reads `explain/dist/index.iife.js` from the installed
 plugin and registers that isolated TypeScript parser with
 `@tabularis/explain`.
 
-The parser source builds the `explain/dist/index.iife.js` bundle shipped with
-each plugin archive. The fork keeps the parser package private and does not
-publish it to npm. The complete parser and wire contract is in
-[`docs/explain-architecture.md`](docs/explain-architecture.md).
+The same source builds the independently versioned
+`@tabularis/explain-sqlserver` ESM package for browser and Node consumers such
+as [explain.tabularis.dev](https://explain.tabularis.dev). This keeps SQL Server
+semantics owned by this plugin while letting renderer improvements apply
+without another Rust implementation. The complete parser and wire contract is
+in [`docs/explain-architecture.md`](docs/explain-architecture.md).
 
 ## Installation
 
-### Release archive
+### From a release package
 
-The fork publishes platform ZIPs and SHA-256 sidecars to the
-[SQL Server Plus GitHub releases](https://github.com/hei5enbug/tabularis-sqlserver-plus/releases).
-It does not publish to the upstream plugin registry or npm. Use a compatible
-Tabularis Extended profile; the installer will only target the explicit
-profile data directory supplied by you.
+`just package` builds `sqlserver-plus-<os>-<arch>.zip` with a matching
+`.sha256` file. The package is not registered in the upstream plugin registry.
+Verify and install an archive with the recipes below, or extract it by hand:
 
-### Manual Installation
+1. Quit Tabularis Extended.
+2. Check the archive against its `.sha256` file (`shasum -a 256 -c`).
+3. Extract it into the Extended profile's plugin directory, never into the
+   official `tabularis` directory:
+   - **Linux:** `~/.local/share/tabularis-extended/plugins/drivers/sqlserver-plus/`
+   - **macOS:** `~/Library/Application Support/tabularis-extended/plugins/drivers/sqlserver-plus/`
+   - **Windows:** `%APPDATA%\tabularis-extended\plugins\drivers\sqlserver-plus\`
+4. On Linux/macOS, make the binary executable: `chmod +x sqlserver-plugin`
+5. Start Tabularis Extended — *SQL Server Plus* appears in the connection picker.
 
-Once release assets are available, download the ZIP and its `.sha256` sidecar.
-The installer validates the checksum and archive layout first. It performs a
-dry run by default. Run it from a checkout of this fork:
-
-Close Tabularis Extended and any Tabularis MCP clients using the profile before
-installing or restoring a package. Keep them closed until the operation is
-complete.
-
-```bash
-node scripts/install.mjs \
-  --archive sqlserver-plus-linux-x64.zip \
-  --sha256 sqlserver-plus-linux-x64.zip.sha256 \
-  --profile-data-dir "/absolute/path/to/Tabularis Extended data"
-```
-
-Review the printed target. To apply the same verified archive, add `--apply`.
-The destination is `<profile-data-dir>/plugins/drivers/sqlserver-plus`. The
-installer stages the complete plugin beside the destination, renames the
-existing `sqlserver-plus` directory to a backup, activates the new directory,
-and restores the old directory if activation fails. After a successful update,
-the installer prints and retains the backup path for an explicit rollback.
-Keep it until the new plugin has been verified. To restore it, close Tabularis
-Extended and MCP clients, move the current
-`<profile-data-dir>/plugins/drivers/sqlserver-plus` directory aside, then move
-the printed backup directory back to that exact target. It does not change
-other driver packages or profile files. Use the Extended profile's actual data
-directory for your operating system; the installer does not infer a profile
-or fall back to a different Tabularis installation.
-
-For a macOS or Linux rollback, use the exact backup path printed by the
-installer and keep the current directory aside until the restored version is
-verified:
+The host accepts the package only when `.tabularium` has `id`
+`sqlserver-plus`, a `min_runtime_version` the host satisfies, and an
+`executable` that is a regular file inside the package directory. Setting
+`TABULARIS_PLUGIN_DIR` to an absolute path moves the whole plugins root, for
+the host and for the recipes alike.
 
 ```bash
-TARGET="/absolute/path/to/Tabularis Extended data/plugins/drivers/sqlserver-plus"
-BACKUP="/absolute/path/printed/by/the/installer"
-mv "$TARGET" "${TARGET}.before-rollback"
-mv "$BACKUP" "$TARGET"
+just install-dry-run                 # show the destination and run the manifest preflight; writes nothing
+just verify-package dist/sqlserver-plus-darwin-arm64.zip
+just install-package dist/sqlserver-plus-darwin-arm64.zip
 ```
-
-The ZIP contains the native executable, `.tabularium`, UI extension, EXPLAIN
-parser, README, Apache license, and the upstream TDS bridge's MIT license.
-SHA-256 checks accidental corruption against the downloaded sidecar; it is not
-a digital signature.
 
 ## How It Works
 
@@ -413,8 +376,7 @@ remaining pools.
 
 ## Known Limitations
 
-- SQL authentication, Windows/Kerberos integrated authentication (`integrated_auth`), and Entra user authentication through Azure CLI are supported. Entra is limited to public Azure SQL hostnames and the explicit TLS checks above.
-- A cancelled query returns JSON-RPC error `-32800` with `server_termination_confirmed: true` only after the SQL Server TDS ATTENTION acknowledgement is received. If the connection ends before that acknowledgement, the query result keeps its original driver status and the uncertain connection is discarded. The plugin does not issue `KILL` statements or replay queries.
+- SQL authentication, Windows/Kerberos integrated authentication (`integrated_auth`), and Microsoft Entra user authentication through the signed-in Azure CLI (`auth_mode=entra_user`) are supported. The driver obtains its own Azure SQL token for each new session; the host never supplies one, and the service capability `entra_token` is `false`. Entra login and MFA stay a user action in Azure CLI.
 - Primary-key membership changes are disabled: the single-column alteration API cannot safely preserve composite PKs and referencing foreign keys.
 - Custom CA files are rejected explicitly; strict verification uses the system trust store.
 - SQL Server has indexed views, not materialized views. Indexed views are maintained synchronously and have no refresh operation, so `get_materialized_views`, `get_materialized_view_columns`, `get_materialized_view_definition`, and `refresh_materialized_view` deliberately return `-32601` rather than pretending the features are equivalent.
@@ -425,36 +387,31 @@ remaining pools.
 ### Prerequisites
 
 - Rust (stable, see `rust-toolchain.toml`)
-- Node.js 24.21.0 and npm 11.6.2 for the connection extension; pnpm 11.23.0 for the bundled Visual EXPLAIN parser
+- Node.js 22.13 or newer and pnpm 11 for building the bundled Visual EXPLAIN parser
 - [`just`](https://github.com/casey/just) (optional, wraps the common build and test commands)
 
 ### Build
 
 ```bash
 just build      # debug build
-just release    # release build (what the GitHub Actions workflow ships)
+just release    # locked release build, UI and EXPLAIN bundles included
+just package    # release package + SHA-256 file in dist/ (just package OUT_DIR for another folder)
 ```
 
-Build commands use `cargo --locked`, `npm ci`, and `pnpm install
---frozen-lockfile` and always build both JavaScript bundles. Run
-`just manifest-check` after the build to verify the manifest's fork identity,
-version, host floor, and referenced bundle files.
+`ui/` and `explain/` install from their frozen pnpm lockfiles. A backend-only
+build is not a complete package: the UI bundle and the EXPLAIN parser bundle
+are required.
 
-### Prepare an archive
+### Install Locally
 
 ```bash
-just test-packaging
-node scripts/package.mjs \
-  --binary target/release/sqlserver-plugin \
-  --platform linux-x64 \
-  --output dist/sqlserver-plus-linux-x64.zip
+just preflight        # check package identity, aligned versions and plugin settings
+just dev-install      # debug build + copy binary, manifest and bundles into the Extended plugin directory
+just uninstall        # remove the installed package
 ```
 
-Windows packages use `target/release/sqlserver-plugin.exe` and
-`--platform win-x64`. Packaging writes a sorted ZIP with a fixed timestamp and
-file modes, plus a SHA-256 sidecar. See [`docs/build-release.md`](docs/build-release.md)
-for the platform matrix, installer contract, and release checks. Local install
-commands do not write into a real profile.
+The destination is `<Extended app data>/plugins/drivers/sqlserver-plus`; set
+`TABULARIS_APP_DIR` only to target a different profile deliberately.
 
 ## Development
 
@@ -465,8 +422,6 @@ Unit tests need no database:
 ```bash
 just test
 just test-explain
-just test-containers
-just test-packaging
 just lint
 just fmt
 ```
@@ -484,17 +439,22 @@ or use the interactive REPL:
 just repl
 ```
 
-### SQL Server integration tests
+### Setting Up a Local SQL Server
 
 ```bash
-just test-containers
+just run-sqlserver    # SQL Server 2022 in Docker (sa / Str0ng!Passw0rd)
+just seed-sqlserver   # create and seed the tabularis_test database
+just stop-sqlserver   # stop and remove the container
 ```
 
-The Testcontainers suite starts its own digest-pinned SQL Server container with
-a generated password and random port, then removes it after the tests. It does
-not use fixed ports, seeded databases, or existing database credentials. See
-[`tests/containers/README.md`](tests/containers/README.md) for the exact
-coverage and Docker requirements.
+The live JSON-RPC integration suite uses the same container:
+
+```bash
+SQLSERVER_PLUGIN_BIN="$PWD/target/debug/sqlserver-plugin" \
+SQLSERVER_TEST_HOST=127.0.0.1 \
+SQLSERVER_TEST_PASSWORD='Str0ng!Passw0rd' \
+cargo test --test live_db -- --test-threads=1
+```
 
 ## Contributing
 
@@ -517,12 +477,10 @@ so a missing or ambiguous label fails the version-suggestion check.
 
 ### Releasing
 
-A release uses a `plus-v<version>` tag. The Release workflow builds platform
-ZIPs and SHA-256 sidecars, then publishes those assets and `.tabularium` to a
-GitHub release in `hei5enbug/tabularis-sqlserver-plus`. It does not publish to
-npm or the upstream registry. `.tabularium`, `Cargo.toml`, `ui/package.json`,
-and `explain/package.json` must all use the exact tag version; the workflow
-checks the repository and version before building.
+A release is a single tag. Before tagging, set the same version in
+`.tabularium`, `Cargo.toml` (and `Cargo.lock`), `explain/package.json`, and
+`ui/package.json`; `just preflight` checks that they agree and that the
+manifest identity is `sqlserver-plus`.
 
 Before opening a PR, run:
 

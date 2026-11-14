@@ -57,7 +57,7 @@ fn rowversion_and_timestamp_are_not_offered_as_blobs() {
 
 /// 빈 출력 경로는 거부한다.
 #[test]
-fn writable_path_validation_rejects_empty_directory_and_missing_parent() {
+fn writable_path_validation_rejects_empty_path() {
     // given
     let path = "";
 
@@ -98,7 +98,7 @@ fn writable_path_validation_rejects_missing_parent() {
 
 /// 기존 상위 디렉터리의 출력 파일 경로는 허용한다.
 #[test]
-fn writable_path_validation_accepts_existing_parent_and_bare_filename() {
+fn writable_path_validation_accepts_existing_parent() {
     // given
     let path = std::env::temp_dir().join("ss012-output.bin");
 

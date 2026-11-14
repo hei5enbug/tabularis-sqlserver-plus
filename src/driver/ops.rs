@@ -8,13 +8,14 @@ use mssql_tiberius_bridge::ToSql;
 use tokio::select;
 
 use crate::cancellation::{QueryCancellation, QueryExecutionError};
+
 use crate::driver::helpers::{
     bracket_quote, build_delete_composite_sql, build_insert_sql_with_expressions,
     build_update_composite_sql_with_expression, qualify, raw_sql_expression,
 };
 use crate::driver::{
-    acquire, blob, ddl, execute_on_connection, explain, helpers, introspection, routines, triggers,
-    users,
+    acquire, blob, ddl, execute_on_connection, execute_on_connection_with_cancellation, explain,
+    helpers, introspection, routines, triggers, users,
 };
 use crate::models::{
     AiSchemaContext, BatchStatementResult, ColumnDefinition, ConnectionParams, DbPrivilegeCatalog,
@@ -377,25 +378,37 @@ pub async fn execute_query(
     execute_on_connection(&mut conn, query, limit, page).await
 }
 
+pub async fn execute_batch(
+    params: &ConnectionParams,
+    queries: &[String],
+    limit: Option<u32>,
+    page: u32,
+) -> Result<Vec<BatchStatementResult>, String> {
+    let mut conn = acquire(params).await?;
+    let mut results = Vec::with_capacity(queries.len());
+    for query in queries {
+        let start = std::time::Instant::now();
+        let outcome = execute_on_connection(&mut conn, query, limit, page).await;
+        results.push(BatchStatementResult::from_outcome(start, outcome));
+    }
+    Ok(results)
+}
+
+/// Pool checkout that gives up as soon as the request is cancelled. No SQL
+/// of the request has been sent at that point.
 async fn acquire_for_query(
     params: &ConnectionParams,
-    cancellation: Option<&QueryCancellation>,
+    cancellation: &QueryCancellation,
 ) -> Result<deadpool::managed::Object<crate::driver::pool::BridgeManager>, QueryExecutionError> {
-    let Some(cancellation) = cancellation else {
-        return acquire(params).await.map_err(QueryExecutionError::Driver);
-    };
     if cancellation.cancelled_before_dispatch() {
-        return Err(QueryExecutionError::CancelledConfirmed);
+        return Err(QueryExecutionError::CancelledBeforeDispatch);
     }
-
     let acquired = wait_for_cancellable_checkout(cancellation, acquire(params)).await?;
-
-    // The cancellation may have arrived at the same time as checkout. No SQL
-    // from this request has been sent, so this remains a confirmed pre-dispatch
-    // cancellation and the checked-out client can return to its pool.
+    // The cancellation may have arrived together with the checkout. Nothing
+    // was sent yet, so the client can go back to its pool.
     if cancellation.cancelled_before_dispatch() {
         drop(acquired);
-        return Err(QueryExecutionError::CancelledConfirmed);
+        return Err(QueryExecutionError::CancelledBeforeDispatch);
     }
     Ok(acquired)
 }
@@ -406,7 +419,7 @@ async fn wait_for_cancellable_checkout<T>(
 ) -> Result<T, QueryExecutionError> {
     select! {
         biased;
-        _ = cancellation.cancelled() => Err(QueryExecutionError::CancelledConfirmed),
+        _ = cancellation.cancelled() => Err(QueryExecutionError::CancelledBeforeDispatch),
         result = checkout => result.map_err(QueryExecutionError::Driver),
     }
 }
@@ -416,57 +429,43 @@ pub async fn execute_query_with_cancellation(
     query: &str,
     limit: Option<u32>,
     page: u32,
-    cancellation: Option<&QueryCancellation>,
-) -> Result<crate::models::QueryResult, QueryExecutionError> {
+    cancellation: &QueryCancellation,
+) -> Result<QueryResult, QueryExecutionError> {
     let mut conn = acquire_for_query(params, cancellation).await?;
-    match cancellation {
-        Some(cancellation) => {
-            crate::driver::execute_on_connection_with_cancellation(
-                &mut conn,
-                query,
-                limit,
-                page,
-                cancellation,
-            )
-            .await
-        }
-        None => execute_on_connection(&mut conn, query, limit, page)
-            .await
-            .map_err(QueryExecutionError::Driver),
-    }
+    execute_on_connection_with_cancellation(&mut conn, query, limit, page, cancellation).await
 }
 
+/// Like [`execute_batch`], but a cancellation ends the whole batch instead of
+/// being reported as one statement's error.
 pub async fn execute_batch_with_cancellation(
     params: &ConnectionParams,
     queries: &[String],
     limit: Option<u32>,
     page: u32,
-    cancellation: Option<&QueryCancellation>,
+    cancellation: &QueryCancellation,
 ) -> Result<Vec<BatchStatementResult>, QueryExecutionError> {
     let mut conn = acquire_for_query(params, cancellation).await?;
     let mut results = Vec::with_capacity(queries.len());
     for query in queries {
         let start = std::time::Instant::now();
-        let outcome = match cancellation {
-            Some(cancellation) => match crate::driver::execute_on_connection_with_cancellation(
-                &mut conn,
-                query,
-                limit,
-                page,
-                cancellation,
-            )
-            .await
-            {
-                Ok(result) => Ok(result),
-                Err(QueryExecutionError::CancelledConfirmed) => {
-                    return Err(QueryExecutionError::CancelledConfirmed);
-                }
-                Err(QueryExecutionError::Driver(message)) if cancellation.is_cancelled() => {
-                    return Err(QueryExecutionError::Driver(message));
-                }
-                Err(QueryExecutionError::Driver(message)) => Err(message),
-            },
-            None => execute_on_connection(&mut conn, query, limit, page).await,
+        let outcome = match execute_on_connection_with_cancellation(
+            &mut conn,
+            query,
+            limit,
+            page,
+            cancellation,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(
+                error @ (QueryExecutionError::CancelledBeforeDispatch
+                | QueryExecutionError::Cancelled),
+            ) => return Err(error),
+            Err(QueryExecutionError::Driver(message)) if cancellation.is_cancelled() => {
+                return Err(QueryExecutionError::Driver(message));
+            }
+            Err(QueryExecutionError::Driver(message)) => Err(message),
         };
         results.push(BatchStatementResult::from_outcome(start, outcome));
     }
@@ -884,12 +883,13 @@ pub async fn get_ai_schema_context(
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+    use crate::cancellation::CancellationRegistry;
     use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn 취소된_pool_checkout은_checkout이_끝나기_전에_반환한다() {
         // given
-        let registry = crate::cancellation::CancellationRegistry::default();
+        let registry = CancellationRegistry::default();
         let lease = registry.register(84).unwrap();
         let (started_tx, started_rx) = oneshot::channel();
         let checkout = async move {
@@ -908,7 +908,20 @@ mod cancellation_tests {
         let result = checkout_result.await;
 
         // then
-        assert_eq!(result, Err(QueryExecutionError::CancelledConfirmed));
+        assert_eq!(result, Err(QueryExecutionError::CancelledBeforeDispatch));
         assert!(lease.control().cancelled_before_dispatch());
+    }
+
+    #[tokio::test]
+    async fn 끝난_pool_checkout은_취소되지_않은_요청의_결과를_돌려준다() {
+        // given
+        let registry = CancellationRegistry::default();
+        let lease = registry.register(85).unwrap();
+
+        // when
+        let result = wait_for_cancellable_checkout(lease.control(), async { Ok(7) }).await;
+
+        // then
+        assert_eq!(result, Ok(7));
     }
 }
